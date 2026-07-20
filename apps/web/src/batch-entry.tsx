@@ -1,5 +1,5 @@
-import React from 'react';
-import { createRoot, Root } from 'react-dom/client';
+import { createRoot } from 'react-dom/client';
+import type { Root } from 'react-dom/client';
 import BatchWorkspace from './BatchWorkspace';
 
 type BatchPayload = { id: string; items: unknown[] };
@@ -9,6 +9,11 @@ let latestBatch: BatchPayload | null = null;
 let root: Root | null = null;
 let mountedHost: HTMLElement | null = null;
 let timer = 0;
+
+function requestUrl(input: RequestInfo | URL) {
+  if (input instanceof Request) return input.url;
+  return String(input);
+}
 
 function mount(attempt = 0) {
   window.clearTimeout(timer);
@@ -38,7 +43,7 @@ function mount(attempt = 0) {
 window.fetch = async (...args) => {
   const response = await originalFetch(...args);
   try {
-    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+    const url = requestUrl(args[0]);
     if (/\/api\/queries\/batch$/.test(url) || /\/api\/batches\/[^/?]+/.test(url)) {
       const data = await response.clone().json();
       if (data?.id && Array.isArray(data.items)) {
