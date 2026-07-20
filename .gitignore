@@ -1,0 +1,39 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+.next/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and runtime data
+*.log
+storage/
+downloads/
+exports/
+sessions/
+
+# Credentials
+*.session
+*.session-journal
+*.pem
+*.key
+credentials.json
