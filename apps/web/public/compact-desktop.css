@@ -1,0 +1,275 @@
+/* Compact desktop layout — loaded after all other styles */
+@media (min-width: 1100px) {
+  html { font-size: 14px; }
+
+  .app-shell {
+    grid-template-columns: 230px minmax(0, 1fr) !important;
+  }
+
+  .sidebar {
+    padding: 16px 12px 14px !important;
+  }
+
+  .brand {
+    gap: 10px !important;
+    padding: 0 6px 18px !important;
+  }
+
+  .brand-mark {
+    width: 36px !important;
+    height: 36px !important;
+    border-radius: 11px !important;
+  }
+
+  .brand strong { font-size: 14px !important; }
+  .brand span { font-size: 10px !important; }
+
+  .main-nav { gap: 4px !important; }
+
+  .nav-item {
+    min-height: 38px !important;
+    padding: 9px 10px !important;
+    border-radius: 10px !important;
+    gap: 9px !important;
+    font-size: 12px !important;
+  }
+
+  .user-card {
+    margin-top: 10px !important;
+    padding: 9px !important;
+    border-radius: 11px !important;
+  }
+
+  .avatar {
+    width: 30px !important;
+    height: 30px !important;
+  }
+
+  .content {
+    max-width: 1280px !important;
+    padding: 22px 28px 36px !important;
+  }
+
+  .topbar {
+    margin-bottom: 18px !important;
+  }
+
+  .eyebrow {
+    margin-bottom: 6px !important;
+    font-size: 9px !important;
+  }
+
+  .topbar h1 {
+    font-size: clamp(24px, 2vw, 28px) !important;
+  }
+
+  .subtitle {
+    margin-top: 6px !important;
+    font-size: 12px !important;
+    line-height: 1.45 !important;
+  }
+
+  .status-pill {
+    padding: 7px 10px !important;
+    font-size: 10px !important;
+  }
+
+  .hero-card,
+  .result-card,
+  .page-card {
+    border-radius: 15px !important;
+  }
+
+  .hero-card {
+    padding: 16px !important;
+  }
+
+  .hero-icon {
+    width: 36px !important;
+    height: 36px !important;
+    border-radius: 11px !important;
+  }
+
+  .hero-copy h2,
+  .result-header h2 {
+    font-size: 14px !important;
+  }
+
+  .hero-copy p {
+    font-size: 11px !important;
+  }
+
+  .search-type-row,
+  .query-form {
+    margin-top: 14px !important;
+  }
+
+  .query-row {
+    gap: 9px !important;
+  }
+
+  .input-wrap {
+    height: 44px !important;
+    padding: 0 12px !important;
+    border-radius: 10px !important;
+  }
+
+  .input-wrap input {
+    font-size: 13px !important;
+  }
+
+  .primary-button {
+    min-width: 145px !important;
+    min-height: 44px !important;
+    padding: 0 18px !important;
+    border-radius: 10px !important;
+    font-size: 12px !important;
+  }
+
+  .secondary-button {
+    padding: 8px 10px !important;
+    border-radius: 9px !important;
+    font-size: 10px !important;
+  }
+
+  .metrics-grid {
+    gap: 10px !important;
+    margin: 12px 0 !important;
+  }
+
+  .metrics-grid article {
+    padding: 12px !important;
+    border-radius: 12px !important;
+  }
+
+  .metric-icon {
+    width: 34px !important;
+    height: 34px !important;
+    border-radius: 10px !important;
+  }
+
+  .metrics-grid strong {
+    font-size: 16px !important;
+  }
+
+  .result-card {
+    min-height: 330px !important;
+  }
+
+  .result-header {
+    padding: 14px 16px !important;
+  }
+
+  .result-body {
+    padding: 14px !important;
+  }
+
+  .result-body pre {
+    max-height: 360px !important;
+    padding: 14px !important;
+    border-radius: 11px !important;
+    font-size: 11px !important;
+    line-height: 1.55 !important;
+  }
+
+  .empty-state,
+  .loading-state {
+    min-height: 260px !important;
+    padding: 22px !important;
+  }
+
+  .page-card {
+    padding: 16px !important;
+  }
+
+  .page-card-header {
+    margin-bottom: 12px !important;
+  }
+
+  .active-batch {
+    padding: 14px !important;
+  }
+
+  .batch-textarea {
+    min-height: 130px !important;
+    max-height: 240px !important;
+    font-size: 12px !important;
+  }
+
+  .batch-counters {
+    gap: 8px !important;
+    font-size: 10px !important;
+  }
+
+  .simple-batch-tabs {
+    margin-top: 12px !important;
+  }
+
+  .simple-batch-title {
+    padding: 10px 12px !important;
+  }
+
+  .simple-batch-tabbar {
+    padding: 6px 8px 0 !important;
+  }
+
+  .simple-batch-tab {
+    min-width: 128px !important;
+    height: 37px !important;
+    padding: 0 10px !important;
+    font-size: 10px !important;
+  }
+
+  .simple-batch-tab.active {
+    height: 40px !important;
+  }
+
+  .simple-batch-content {
+    max-height: 440px !important;
+  }
+
+  .simple-batch-header {
+    padding: 12px !important;
+  }
+
+  .simple-field-row {
+    padding: 9px 11px !important;
+  }
+
+  .simple-field-row small { font-size: 9px !important; }
+  .simple-field-row strong { font-size: 11px !important; }
+
+  .history-item,
+  .admin-user {
+    padding: 10px 12px !important;
+  }
+
+  .admin-status-grid {
+    gap: 10px !important;
+  }
+
+  .admin-status-grid article {
+    padding: 12px !important;
+  }
+}
+
+@media (min-width: 1500px) {
+  .content {
+    max-width: 1360px !important;
+  }
+}
+
+@media (max-width: 1099px) and (min-width: 721px) {
+  .content {
+    max-width: none !important;
+    padding: 22px 18px 34px !important;
+  }
+
+  .topbar h1 {
+    font-size: 25px !important;
+  }
+
+  .hero-card {
+    padding: 18px !important;
+  }
+}
