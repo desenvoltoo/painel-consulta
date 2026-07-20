@@ -14,11 +14,14 @@ logger = logging.getLogger("telegram-worker")
 REDIS_URL = os.getenv("REDIS_URL", "redis://consulta-redis:6379/0")
 QUEUE_NAME = os.getenv("QUERY_QUEUE_NAME", "painel-consulta:queries")
 PROCESSING_QUEUE_NAME = os.getenv("QUERY_PROCESSING_QUEUE_NAME", "painel-consulta:processing")
+DEAD_LETTER_QUEUE_NAME = os.getenv("QUERY_DEAD_LETTER_QUEUE_NAME", "painel-consulta:dead-letter")
 WORKER_HEARTBEAT_KEY = os.getenv("WORKER_HEARTBEAT_KEY", "painel-consulta:worker:heartbeat")
 QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "120"))
 HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "10"))
 RESPONSE_SETTLE_SECONDS = float(os.getenv("TELEGRAM_RESPONSE_SETTLE_SECONDS", "1.2"))
 RECORD_TTL_SECONDS = int(os.getenv("RECORD_TTL_SECONDS", "2592000"))
+MAX_RETRIES = int(os.getenv("QUERY_MAX_RETRIES", "2"))
+RETRY_DELAY_SECONDS = float(os.getenv("QUERY_RETRY_DELAY_SECONDS", "2"))
 
 
 def query_key(query_id: str) -> str:
@@ -55,6 +58,10 @@ async def heartbeat_loop(redis_client, group_entity, bot_username: str, current_
             "current_query_id": current_job.get("id"),
             "current_command": current_job.get("command"),
             "current_batch_id": current_job.get("batch_id"),
+            "current_attempt": current_job.get("attempt"),
+            "queue_waiting": await redis_client.llen(QUEUE_NAME),
+            "queue_processing": await redis_client.llen(PROCESSING_QUEUE_NAME),
+            "dead_letter": await redis_client.llen(DEAD_LETTER_QUEUE_NAME),
         }
         await redis_client.set(WORKER_HEARTBEAT_KEY, json.dumps(payload, ensure_ascii=False), ex=max(HEARTBEAT_SECONDS * 3, 30))
         await asyncio.sleep(HEARTBEAT_SECONDS)
@@ -66,6 +73,13 @@ async def recover_processing_jobs(redis_client) -> int:
         raw_job = await redis_client.rpop(PROCESSING_QUEUE_NAME)
         if raw_job is None:
             break
+        try:
+            job = json.loads(raw_job)
+            job["recovered"] = int(job.get("recovered", 0)) + 1
+            raw_job = json.dumps(job, ensure_ascii=False)
+        except json.JSONDecodeError:
+            await redis_client.lpush(DEAD_LETTER_QUEUE_NAME, raw_job)
+            continue
         await redis_client.rpush(QUEUE_NAME, raw_job)
         recovered += 1
     if recovered:
@@ -119,11 +133,35 @@ async def finalize_query(redis_client, job: dict, status: str, content: str = ""
         "content": content,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_ms": elapsed_ms,
+        "attempts": int(job.get("attempt", 0)) + 1,
     }
     if error:
         mapping["error"] = error
     await redis_client.hset(query_key(query_id), mapping=mapping)
     await redis_client.expire(query_key(query_id), RECORD_TTL_SECONDS)
+
+
+async def retry_or_fail(redis_client, raw_job: str, job: dict, batch_id: str | None, error: str) -> bool:
+    attempt = int(job.get("attempt", 0))
+    if attempt < MAX_RETRIES:
+        job["attempt"] = attempt + 1
+        job["last_error"] = error
+        job["last_retry_at"] = datetime.now(timezone.utc).isoformat()
+        await redis_client.hset(query_key(job.get("id", "")), mapping={"status": "QUEUED", "error": error, "attempts": attempt + 1})
+        await update_batch(redis_client, batch_id, "PROCESSING", "QUEUED")
+        await asyncio.sleep(RETRY_DELAY_SECONDS)
+        await redis_client.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
+        logger.warning("Consulta %s reenfileirada. Tentativa %s/%s.", job.get("id"), attempt + 1, MAX_RETRIES)
+        return True
+
+    dead_letter = {
+        **job,
+        "final_error": error,
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": attempt + 1,
+    }
+    await redis_client.lpush(DEAD_LETTER_QUEUE_NAME, json.dumps(dead_letter, ensure_ascii=False))
+    return False
 
 
 async def process_job(client, redis_client, group_entity, bot_entity, raw_job: str, job: dict, current_job: dict) -> None:
@@ -140,10 +178,10 @@ async def process_job(client, redis_client, group_entity, bot_entity, raw_job: s
         await redis_client.lrem(PROCESSING_QUEUE_NAME, 1, raw_job)
         return
 
-    await redis_client.hset(query_key(query_id), mapping={"status": "PROCESSING"})
+    await redis_client.hset(query_key(query_id), mapping={"status": "PROCESSING", "attempts": int(job.get("attempt", 0)) + 1})
     await update_batch(redis_client, batch_id, "QUEUED", "PROCESSING")
     current_job.clear()
-    current_job.update({"id": query_id, "command": command, "batch_id": batch_id})
+    current_job.update({"id": query_id, "command": command, "batch_id": batch_id, "attempt": int(job.get("attempt", 0)) + 1})
 
     first_response = asyncio.Event()
     response_parts: list[str] = []
@@ -186,16 +224,21 @@ async def process_job(client, redis_client, group_entity, bot_entity, raw_job: s
         logger.info("Consulta %s concluída com %s resposta(s).", query_id, len(response_parts))
     except asyncio.TimeoutError:
         error = "O bot não respondeu dentro do tempo limite."
-        elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms)
-        await update_batch(redis_client, batch_id, "PROCESSING", "FAILED")
-        await publish_result(redis_client, result_queue, {"status": "ERROR", "error": error})
+        retried = await retry_or_fail(redis_client, raw_job, job, batch_id, error)
+        if not retried:
+            elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms)
+            await update_batch(redis_client, batch_id, "PROCESSING", "FAILED")
+            await publish_result(redis_client, result_queue, {"status": "ERROR", "error": error})
         logger.warning("Consulta %s expirou aguardando resposta.", query_id)
     except Exception as exc:
-        elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        await finalize_query(redis_client, job, "FAILED", error=str(exc), elapsed_ms=elapsed_ms)
-        await update_batch(redis_client, batch_id, "PROCESSING", "FAILED")
-        await publish_result(redis_client, result_queue, {"status": "ERROR", "error": str(exc)})
+        error = str(exc)
+        retried = await retry_or_fail(redis_client, raw_job, job, batch_id, error)
+        if not retried:
+            elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms)
+            await update_batch(redis_client, batch_id, "PROCESSING", "FAILED")
+            await publish_result(redis_client, result_queue, {"status": "ERROR", "error": error})
         logger.exception("Falha ao processar consulta %s.", query_id)
     finally:
         client.remove_event_handler(on_bot_message, event_builder)
@@ -226,7 +269,7 @@ async def main() -> None:
 
     current_job: dict = {}
     heartbeat_task = asyncio.create_task(heartbeat_loop(redis_client, group_entity, bot_username, current_job))
-    logger.info("Worker pronto. Grupo=%s Bot=@%s Fila=%s Processamento=%s", utils.get_peer_id(group_entity), bot_username, QUEUE_NAME, PROCESSING_QUEUE_NAME)
+    logger.info("Worker pronto. Grupo=%s Bot=@%s Fila=%s Processamento=%s DeadLetter=%s", utils.get_peer_id(group_entity), bot_username, QUEUE_NAME, PROCESSING_QUEUE_NAME, DEAD_LETTER_QUEUE_NAME)
 
     try:
         while True:
@@ -237,6 +280,7 @@ async def main() -> None:
                 job = json.loads(raw_job)
             except json.JSONDecodeError:
                 logger.exception("Job inválido recebido na fila.")
+                await redis_client.lpush(DEAD_LETTER_QUEUE_NAME, raw_job)
                 await redis_client.lrem(PROCESSING_QUEUE_NAME, 1, raw_job)
                 continue
             await process_job(client, redis_client, group_entity, bot_entity, raw_job, job, current_job)
