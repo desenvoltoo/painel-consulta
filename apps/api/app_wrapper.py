@@ -7,19 +7,30 @@ import json
 import os
 import time
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import redis.asyncio as redis
 from fastapi import Depends, HTTPException
 
 from main import (
+    BATCH_INDEX,
     PROCESSING_QUEUE_NAME,
     QUEUE_NAME,
+    RECORD_TTL_SECONDS,
     REDIS_URL,
     WORKER_HEARTBEAT_KEY,
+    BatchRequest,
+    BatchResponse,
+    QueryResponse,
     admin_user,
     app,
+    batch_key,
     current_user,
     query_key,
+    read_batch,
+    save_query,
+    serialize_record,
+    utc_now,
 )
 
 FILE_DOWNLOAD_SECRET = os.getenv("FILE_DOWNLOAD_SECRET", "")
@@ -101,6 +112,99 @@ async def refresh_attachment_link(query_id: str, attachment_id: str, user: dict 
         "download_url": f"{FILE_PUBLIC_BASE_URL}/files/{token}",
         "expires_in": FILE_LINK_TTL_SECONDS,
     }
+
+
+# Remove a rota antiga para registrar uma versão atômica da criação de lotes.
+app.router.routes[:] = [
+    route
+    for route in app.router.routes
+    if not (getattr(route, "path", None) == "/api/queries/batch" and "POST" in getattr(route, "methods", set()))
+]
+
+
+@app.post("/api/queries/batch", response_model=BatchResponse)
+async def create_batch_atomic(payload: BatchRequest, user: dict = Depends(current_user)) -> BatchResponse:
+    if user.get("must_change_password"):
+        raise HTTPException(status_code=403, detail="Troque sua senha antes de realizar consultas")
+
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    batch_id = str(uuid4())
+    now = utc_now()
+    item_ids = [str(uuid4()) for _ in payload.values]
+    record = {
+        "id": batch_id,
+        "command_prefix": payload.command_prefix,
+        "status": "QUEUED",
+        "total": len(item_ids),
+        "queued": len(item_ids),
+        "processing": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "requested_by": user["name"],
+        "requested_by_email": user["email"],
+        "items": item_ids,
+    }
+
+    try:
+        pipe = client.pipeline(transaction=True)
+        pipe.hset(batch_key(batch_id), mapping=serialize_record(record))
+        pipe.expire(batch_key(batch_id), RECORD_TTL_SECONDS)
+        pipe.zadd(BATCH_INDEX, {batch_id: now.timestamp()})
+
+        for query_id, value in zip(item_ids, payload.values, strict=True):
+            command = f"{payload.command_prefix} {value}".strip()
+            created_at = utc_now()
+            query_record = {
+                "id": query_id,
+                "command": command,
+                "status": "QUEUED",
+                "content": "",
+                "created_at": created_at.isoformat(),
+                "elapsed_ms": 0,
+                "requested_by": user["name"],
+                "requested_by_email": user["email"],
+                "batch_id": batch_id,
+            }
+            pipe.hset(query_key(query_id), mapping=serialize_record(query_record))
+            pipe.expire(query_key(query_id), RECORD_TTL_SECONDS)
+            pipe.zadd("painel-consulta:history", {query_id: created_at.timestamp()})
+
+        await pipe.execute()
+
+        # Os jobs entram na fila somente depois de lote e consultas existirem.
+        queue_pipe = client.pipeline(transaction=True)
+        for query_id, value in zip(item_ids, payload.values, strict=True):
+            command = f"{payload.command_prefix} {value}".strip()
+            job = {
+                "id": query_id,
+                "command": command,
+                "created_at": now.isoformat(),
+                "result_queue": f"painel-consulta:result:{query_id}",
+                "requested_by": user["email"],
+                "requested_by_name": user["name"],
+                "batch_id": batch_id,
+            }
+            queue_pipe.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
+        await queue_pipe.execute()
+
+        batch = await read_batch(client, batch_id)
+        if not batch:
+            raise HTTPException(status_code=500, detail="Falha ao criar lote")
+        return batch
+    except Exception:
+        cleanup = client.pipeline(transaction=False)
+        cleanup.delete(batch_key(batch_id))
+        cleanup.zrem(BATCH_INDEX, batch_id)
+        for query_id in item_ids:
+            cleanup.delete(query_key(query_id))
+            cleanup.zrem("painel-consulta:history", query_id)
+        await cleanup.execute()
+        raise
+    finally:
+        await client.aclose()
 
 
 @app.get("/api/admin/operations")
