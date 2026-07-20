@@ -1,2 +1,3 @@
 telethon==1.40.0
 redis==6.2.0
+aiohttp==3.12.14
