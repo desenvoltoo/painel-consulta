@@ -3,9 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import time
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from uuid import uuid4
 
 import redis.asyncio as redis
@@ -31,6 +29,7 @@ RECORD_TTL_SECONDS = int(os.getenv("RECORD_TTL_SECONDS", "2592000"))
 
 HISTORY_INDEX = "painel-consulta:history"
 BATCH_INDEX = "painel-consulta:batches"
+USERS_INDEX = "painel-consulta:users"
 
 
 def validate_settings() -> None:
@@ -43,8 +42,7 @@ def validate_settings() -> None:
 
 
 validate_settings()
-
-app = FastAPI(title="Painel de Consulta API", version="0.5.0")
+app = FastAPI(title="Painel de Consulta API", version="0.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("APP_URL", "http://localhost:3000")],
@@ -57,42 +55,66 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
 
-@lru_cache(maxsize=1)
-def configured_users() -> dict[str, dict[str, str]]:
-    users: dict[str, dict[str, str]] = {}
-    definitions = [
-        ("Matheus", "ADMIN", "MATHEUS_EMAIL", "MATHEUS_PASSWORD"),
-        ("Nilza", "OPERADOR", "NILZA_EMAIL", "NILZA_PASSWORD"),
-        ("Robô", "OPERADOR", "ROBO_EMAIL", "ROBO_PASSWORD"),
-    ]
-    for name, role, email_key, password_key in definitions:
-        email = os.getenv(email_key, "").strip().lower()
-        password = os.getenv(password_key, "")
-        if email and password:
-            users[email] = {
-                "name": name,
-                "email": email,
-                "role": role,
-                "password_hash": pwd_context.hash(password),
-            }
-    return users
-
-
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=200)
 
 
 class UserResponse(BaseModel):
+    id: str
     name: str
     email: str
     role: str
+    active: bool
+    must_change_password: bool
+    created_at: datetime
+    last_login_at: datetime | None = None
 
 
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=6, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+class AdminCreateUserRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    role: str = "OPERADOR"
+    password: str = Field(min_length=8, max_length=200)
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        role = value.upper().strip()
+        if role not in {"ADMIN", "OPERADOR"}:
+            raise ValueError("Perfil inválido")
+        return role
+
+
+class AdminUpdateUserRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    role: str | None = None
+    active: bool | None = None
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        role = value.upper().strip()
+        if role not in {"ADMIN", "OPERADOR"}:
+            raise ValueError("Perfil inválido")
+        return role
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8, max_length=200)
 
 
 class QueryRequest(BaseModel):
@@ -163,37 +185,12 @@ class BatchResponse(BaseModel):
     items: list[QueryResponse] = []
 
 
-def create_token(user: dict[str, str]) -> str:
-    expires = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
-    payload = {
-        "sub": user["email"],
-        "name": user["name"],
-        "role": user["role"],
-        "iat": datetime.now(timezone.utc),
-        "exp": expires,
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-async def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict[str, str]:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Autenticação necessária")
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
-        email = str(payload.get("sub", "")).lower()
-    except JWTError as exc:
-        raise HTTPException(status_code=401, detail="Sessão inválida ou expirada") from exc
-    user = configured_users().get(email)
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuário não encontrado")
-    return user
-
-
-def login_attempt_key(request: Request, email: str) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
-    digest = hashlib.sha256(f"{client_ip}|{email.lower()}".encode()).hexdigest()
-    return f"painel-consulta:login-attempts:{digest}"
+def user_key(email: str) -> str:
+    return f"painel-consulta:user:{email.lower()}"
 
 
 def query_key(query_id: str) -> str:
@@ -205,7 +202,17 @@ def batch_key(batch_id: str) -> str:
 
 
 def serialize_record(data: dict) -> dict[str, str]:
-    return {key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value) for key, value in data.items() if value is not None}
+    result: dict[str, str] = {}
+    for key, value in data.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            result[key] = "1" if value else "0"
+        elif isinstance(value, (dict, list)):
+            result[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            result[key] = str(value)
+    return result
 
 
 def parse_hash(data: dict[str, str]) -> dict:
@@ -213,6 +220,8 @@ def parse_hash(data: dict[str, str]) -> dict:
     for key, value in data.items():
         if key in {"total", "queued", "processing", "completed", "failed", "cancelled", "elapsed_ms"}:
             parsed[key] = int(value)
+        elif key in {"active", "must_change_password"}:
+            parsed[key] = value == "1"
         elif key == "items":
             parsed[key] = json.loads(value or "[]")
         else:
@@ -220,10 +229,106 @@ def parse_hash(data: dict[str, str]) -> dict:
     return parsed
 
 
+async def bootstrap_users(client) -> None:
+    definitions = [
+        ("Matheus", "ADMIN", "MATHEUS_EMAIL", "MATHEUS_PASSWORD"),
+        ("Nilza", "OPERADOR", "NILZA_EMAIL", "NILZA_PASSWORD"),
+        ("Robô", "OPERADOR", "ROBO_EMAIL", "ROBO_PASSWORD"),
+    ]
+    for name, role, email_env, password_env in definitions:
+        email = os.getenv(email_env, "").strip().lower()
+        password = os.getenv(password_env, "")
+        if not email or not password:
+            continue
+        key = user_key(email)
+        if await client.exists(key):
+            continue
+        record = {
+            "id": str(uuid4()),
+            "name": name,
+            "email": email,
+            "role": role,
+            "password_hash": pwd_context.hash(password),
+            "active": True,
+            "must_change_password": True,
+            "created_at": utc_now().isoformat(),
+        }
+        await client.hset(key, mapping=serialize_record(record))
+        await client.sadd(USERS_INDEX, email)
+
+
+async def read_user(client, email: str, include_hash: bool = False) -> dict | None:
+    data = await client.hgetall(user_key(email))
+    if not data:
+        return None
+    parsed = parse_hash(data)
+    if not include_hash:
+        parsed.pop("password_hash", None)
+    return parsed
+
+
+def user_response(user: dict) -> UserResponse:
+    return UserResponse(
+        id=user["id"],
+        name=user["name"],
+        email=user["email"],
+        role=user["role"],
+        active=bool(user.get("active", True)),
+        must_change_password=bool(user.get("must_change_password", False)),
+        created_at=user["created_at"],
+        last_login_at=user.get("last_login_at"),
+    )
+
+
+def create_token(user: dict) -> str:
+    now = utc_now()
+    return jwt.encode(
+        {
+            "sub": user["email"],
+            "name": user["name"],
+            "role": user["role"],
+            "iat": now,
+            "exp": now + timedelta(hours=JWT_EXPIRE_HOURS),
+        },
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+
+
+async def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Autenticação necessária")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        email = str(payload.get("sub", "")).lower()
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Sessão inválida ou expirada") from exc
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        user = await read_user(client, email, include_hash=True)
+    finally:
+        await client.aclose()
+    if not user or not user.get("active", False):
+        raise HTTPException(status_code=401, detail="Usuário inexistente ou bloqueado")
+    return user
+
+
+async def admin_user(user: dict = Depends(current_user)) -> dict:
+    if user.get("role") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Acesso restrito ao administrador")
+    return user
+
+
+def login_attempt_key(request: Request, email: str) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    digest = hashlib.sha256(f"{client_ip}|{email.lower()}".encode()).hexdigest()
+    return f"painel-consulta:login-attempts:{digest}"
+
+
 async def save_query(client, record: dict) -> None:
-    key = query_key(record["id"])
-    await client.hset(key, mapping=serialize_record(record))
-    await client.expire(key, RECORD_TTL_SECONDS)
+    await client.hset(query_key(record["id"]), mapping=serialize_record(record))
+    await client.expire(query_key(record["id"]), RECORD_TTL_SECONDS)
     score = datetime.fromisoformat(record["created_at"]).timestamp()
     await client.zadd(HISTORY_INDEX, {record["id"]: score})
     await client.zremrangebyrank(HISTORY_INDEX, 0, -(HISTORY_LIMIT + 1))
@@ -240,19 +345,18 @@ async def read_batch(client, batch_id: str, include_items: bool = True) -> Batch
         return None
     parsed = parse_hash(data)
     item_ids = parsed.pop("items", [])
-    items: list[QueryResponse] = []
+    parsed["items"] = []
     if include_items:
         for query_id in item_ids:
             item = await read_query(client, query_id)
             if item:
-                items.append(item)
-    parsed["items"] = items
+                parsed["items"].append(item)
     return BatchResponse(**parsed)
 
 
-async def enqueue_query(client, command: str, user: dict[str, str], batch_id: str | None = None) -> QueryResponse:
+async def enqueue_query(client, command: str, user: dict, batch_id: str | None = None) -> QueryResponse:
     query_id = str(uuid4())
-    created_at = datetime.now(timezone.utc)
+    created_at = utc_now()
     result_queue = f"painel-consulta:result:{query_id}"
     record = {
         "id": query_id,
@@ -266,17 +370,32 @@ async def enqueue_query(client, command: str, user: dict[str, str], batch_id: st
         "batch_id": batch_id,
     }
     await save_query(client, record)
-    job = {
-        "id": query_id,
-        "command": command,
-        "created_at": created_at.isoformat(),
-        "result_queue": result_queue,
-        "requested_by": user["email"],
-        "requested_by_name": user["name"],
-        "batch_id": batch_id,
-    }
-    await client.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
+    await client.lpush(
+        QUEUE_NAME,
+        json.dumps(
+            {
+                "id": query_id,
+                "command": command,
+                "created_at": created_at.isoformat(),
+                "result_queue": result_queue,
+                "requested_by": user["email"],
+                "requested_by_name": user["name"],
+                "batch_id": batch_id,
+            },
+            ensure_ascii=False,
+        ),
+    )
     return QueryResponse(**record)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await client.ping()
+        await bootstrap_users(client)
+    finally:
+        await client.aclose()
 
 
 @app.get("/api/health")
@@ -292,7 +411,7 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/api/system/status")
-async def system_status(user: dict[str, str] = Depends(current_user)) -> dict:
+async def system_status(user: dict = Depends(current_user)) -> dict:
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         heartbeat_raw = await client.get(WORKER_HEARTBEAT_KEY)
@@ -312,34 +431,135 @@ async def system_status(user: dict[str, str] = Depends(current_user)) -> dict:
 
 @app.post("/api/auth/login", response_model=LoginResponse)
 async def login(payload: LoginRequest, request: Request) -> LoginResponse:
-    email = payload.email.lower()
+    email = payload.email.lower().strip()
     key = login_attempt_key(request, email)
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
+        await bootstrap_users(client)
         attempts = int(await client.get(key) or 0)
         if attempts >= LOGIN_MAX_ATTEMPTS:
             ttl = await client.ttl(key)
             raise HTTPException(status_code=429, detail=f"Muitas tentativas. Tente novamente em {max(ttl, 1)} segundos.")
-        user = configured_users().get(email)
-        if not user or not pwd_context.verify(payload.password, user["password_hash"]):
+        user = await read_user(client, email, include_hash=True)
+        if not user or not user.get("active", False) or not pwd_context.verify(payload.password, user.get("password_hash", "")):
             attempts = await client.incr(key)
             if attempts == 1:
                 await client.expire(key, LOGIN_BLOCK_SECONDS)
             raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
         await client.delete(key)
-        return LoginResponse(access_token=create_token(user), user=UserResponse(name=user["name"], email=user["email"], role=user["role"]))
+        user["last_login_at"] = utc_now().isoformat()
+        await client.hset(user_key(email), mapping={"last_login_at": user["last_login_at"]})
+        return LoginResponse(access_token=create_token(user), user=user_response(user))
     finally:
         await client.aclose()
 
 
 @app.get("/api/auth/me", response_model=UserResponse)
-async def me(user: dict[str, str] = Depends(current_user)) -> UserResponse:
-    return UserResponse(name=user["name"], email=user["email"], role=user["role"])
+async def me(user: dict = Depends(current_user)) -> UserResponse:
+    return user_response(user)
+
+
+@app.post("/api/auth/change-password", response_model=UserResponse)
+async def change_password(payload: ChangePasswordRequest, user: dict = Depends(current_user)) -> UserResponse:
+    if not pwd_context.verify(payload.current_password, user.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Senha atual incorreta")
+    if pwd_context.verify(payload.new_password, user.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="A nova senha deve ser diferente da atual")
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await client.hset(user_key(user["email"]), mapping={"password_hash": pwd_context.hash(payload.new_password), "must_change_password": "0"})
+        updated = await read_user(client, user["email"], include_hash=True)
+        return user_response(updated or user)
+    finally:
+        await client.aclose()
+
+
+@app.get("/api/admin/users", response_model=list[UserResponse])
+async def list_users(_: dict = Depends(admin_user)) -> list[UserResponse]:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await bootstrap_users(client)
+        emails = sorted(await client.smembers(USERS_INDEX))
+        users = []
+        for email in emails:
+            user = await read_user(client, email)
+            if user:
+                users.append(user_response(user))
+        return users
+    finally:
+        await client.aclose()
+
+
+@app.post("/api/admin/users", response_model=UserResponse)
+async def create_user(payload: AdminCreateUserRequest, _: dict = Depends(admin_user)) -> UserResponse:
+    email = payload.email.lower().strip()
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        if await client.exists(user_key(email)):
+            raise HTTPException(status_code=409, detail="Já existe um usuário com este e-mail")
+        record = {
+            "id": str(uuid4()),
+            "name": payload.name.strip(),
+            "email": email,
+            "role": payload.role,
+            "password_hash": pwd_context.hash(payload.password),
+            "active": True,
+            "must_change_password": True,
+            "created_at": utc_now().isoformat(),
+        }
+        await client.hset(user_key(email), mapping=serialize_record(record))
+        await client.sadd(USERS_INDEX, email)
+        return user_response(record)
+    finally:
+        await client.aclose()
+
+
+@app.patch("/api/admin/users/{email}", response_model=UserResponse)
+async def update_user(email: str, payload: AdminUpdateUserRequest, admin: dict = Depends(admin_user)) -> UserResponse:
+    target = email.lower().strip()
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        current = await read_user(client, target, include_hash=True)
+        if not current:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        if target == admin["email"] and payload.active is False:
+            raise HTTPException(status_code=400, detail="Você não pode bloquear o próprio usuário")
+        updates: dict[str, str] = {}
+        if payload.name is not None:
+            updates["name"] = payload.name.strip()
+        if payload.role is not None:
+            updates["role"] = payload.role
+        if payload.active is not None:
+            updates["active"] = "1" if payload.active else "0"
+        if updates:
+            await client.hset(user_key(target), mapping=updates)
+        updated = await read_user(client, target)
+        return user_response(updated or current)
+    finally:
+        await client.aclose()
+
+
+@app.post("/api/admin/users/{email}/reset-password", response_model=UserResponse)
+async def reset_password(email: str, payload: AdminResetPasswordRequest, _: dict = Depends(admin_user)) -> UserResponse:
+    target = email.lower().strip()
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        current = await read_user(client, target, include_hash=True)
+        if not current:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        await client.hset(user_key(target), mapping={"password_hash": pwd_context.hash(payload.new_password), "must_change_password": "1"})
+        updated = await read_user(client, target)
+        return user_response(updated or current)
+    finally:
+        await client.aclose()
 
 
 @app.post("/api/queries", response_model=QueryResponse)
-async def create_query(payload: QueryRequest, user: dict[str, str] = Depends(current_user)) -> QueryResponse:
+async def create_query(payload: QueryRequest, user: dict = Depends(current_user)) -> QueryResponse:
+    if user.get("must_change_password"):
+        raise HTTPException(status_code=403, detail="Troque sua senha antes de realizar consultas")
     client = redis.from_url(REDIS_URL, decode_responses=True)
+    queued: QueryResponse | None = None
     try:
         queued = await enqueue_query(client, payload.command, user)
         result_queue = f"painel-consulta:result:{queued.id}"
@@ -348,7 +568,7 @@ async def create_query(payload: QueryRequest, user: dict[str, str] = Depends(cur
             latest = await read_query(client, queued.id)
             if latest:
                 return latest
-            raise HTTPException(status_code=504, detail="O Telegram não respondeu dentro do tempo limite.")
+            raise HTTPException(status_code=504, detail="O Telegram não respondeu dentro do tempo limite")
         latest = await read_query(client, queued.id)
         if not latest:
             raise HTTPException(status_code=502, detail="Resultado não encontrado")
@@ -356,12 +576,13 @@ async def create_query(payload: QueryRequest, user: dict[str, str] = Depends(cur
             raise HTTPException(status_code=502, detail=latest.error or "Falha no Telegram")
         return latest
     finally:
-        await client.delete(f"painel-consulta:result:{locals().get('queued').id}") if "queued" in locals() else None
+        if queued:
+            await client.delete(f"painel-consulta:result:{queued.id}")
         await client.aclose()
 
 
 @app.get("/api/history", response_model=list[QueryResponse])
-async def history(limit: int = 100, user: dict[str, str] = Depends(current_user)) -> list[QueryResponse]:
+async def history(limit: int = 100, user: dict = Depends(current_user)) -> list[QueryResponse]:
     limit = max(1, min(limit, 500))
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -382,10 +603,12 @@ async def history(limit: int = 100, user: dict[str, str] = Depends(current_user)
 
 
 @app.post("/api/queries/batch", response_model=BatchResponse)
-async def create_batch(payload: BatchRequest, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+async def create_batch(payload: BatchRequest, user: dict = Depends(current_user)) -> BatchResponse:
+    if user.get("must_change_password"):
+        raise HTTPException(status_code=403, detail="Troque sua senha antes de realizar consultas")
     client = redis.from_url(REDIS_URL, decode_responses=True)
     batch_id = str(uuid4())
-    now = datetime.now(timezone.utc).isoformat()
+    now = utc_now().isoformat()
     try:
         item_ids: list[str] = []
         for value in payload.values:
@@ -410,13 +633,16 @@ async def create_batch(payload: BatchRequest, user: dict[str, str] = Depends(cur
         await client.hset(batch_key(batch_id), mapping=serialize_record(record))
         await client.expire(batch_key(batch_id), RECORD_TTL_SECONDS)
         await client.zadd(BATCH_INDEX, {batch_id: datetime.fromisoformat(now).timestamp()})
-        return (await read_batch(client, batch_id))  # type: ignore[return-value]
+        batch = await read_batch(client, batch_id)
+        if not batch:
+            raise HTTPException(status_code=500, detail="Falha ao criar lote")
+        return batch
     finally:
         await client.aclose()
 
 
 @app.get("/api/batches", response_model=list[BatchResponse])
-async def list_batches(limit: int = 50, user: dict[str, str] = Depends(current_user)) -> list[BatchResponse]:
+async def list_batches(limit: int = 50, user: dict = Depends(current_user)) -> list[BatchResponse]:
     limit = max(1, min(limit, 200))
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -437,7 +663,7 @@ async def list_batches(limit: int = 50, user: dict[str, str] = Depends(current_u
 
 
 @app.get("/api/batches/{batch_id}", response_model=BatchResponse)
-async def get_batch(batch_id: str, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+async def get_batch(batch_id: str, user: dict = Depends(current_user)) -> BatchResponse:
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         batch = await read_batch(client, batch_id)
@@ -451,7 +677,7 @@ async def get_batch(batch_id: str, user: dict[str, str] = Depends(current_user))
 
 
 @app.post("/api/batches/{batch_id}/cancel", response_model=BatchResponse)
-async def cancel_batch(batch_id: str, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+async def cancel_batch(batch_id: str, user: dict = Depends(current_user)) -> BatchResponse:
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         batch = await read_batch(client, batch_id, include_items=False)
@@ -459,14 +685,17 @@ async def cancel_batch(batch_id: str, user: dict[str, str] = Depends(current_use
             raise HTTPException(status_code=404, detail="Lote não encontrado")
         if user["role"] != "ADMIN" and batch.requested_by_email != user["email"]:
             raise HTTPException(status_code=403, detail="Acesso negado")
-        await client.hset(batch_key(batch_id), mapping={"status": "CANCEL_REQUESTED", "updated_at": datetime.now(timezone.utc).isoformat()})
-        return (await read_batch(client, batch_id))  # type: ignore[return-value]
+        await client.hset(batch_key(batch_id), mapping={"status": "CANCEL_REQUESTED", "updated_at": utc_now().isoformat()})
+        updated = await read_batch(client, batch_id)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Lote não encontrado")
+        return updated
     finally:
         await client.aclose()
 
 
 @app.post("/api/batches/{batch_id}/retry-failed", response_model=BatchResponse)
-async def retry_failed(batch_id: str, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+async def retry_failed(batch_id: str, user: dict = Depends(current_user)) -> BatchResponse:
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         batch = await read_batch(client, batch_id)
@@ -477,6 +706,6 @@ async def retry_failed(batch_id: str, user: dict[str, str] = Depends(current_use
         failed_values = [item.command.removeprefix(batch.command_prefix).strip() for item in batch.items if item.status == "FAILED"]
         if not failed_values:
             raise HTTPException(status_code=400, detail="Este lote não possui falhas para repetir")
-        return await create_batch(BatchRequest(command_prefix=batch.command_prefix, values=failed_values), user)
     finally:
         await client.aclose()
+    return await create_batch(BatchRequest(command_prefix=batch.command_prefix, values=failed_values), user)
