@@ -1,0 +1,17 @@
+{
+  "name": "Painel de Consultas — Grupo Referência",
+  "short_name": "Consultas",
+  "description": "Painel privado para consultas individuais e em lote.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f6fa",
+  "theme_color": "#6d28d9",
+  "icons": [
+    {
+      "src": "/brand-logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
