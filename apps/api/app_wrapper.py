@@ -6,15 +6,26 @@ import hmac
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 import redis.asyncio as redis
 from fastapi import Depends, HTTPException
 
-from main import REDIS_URL, app, current_user, query_key
+from main import (
+    PROCESSING_QUEUE_NAME,
+    QUEUE_NAME,
+    REDIS_URL,
+    WORKER_HEARTBEAT_KEY,
+    admin_user,
+    app,
+    current_user,
+    query_key,
+)
 
 FILE_DOWNLOAD_SECRET = os.getenv("FILE_DOWNLOAD_SECRET", "")
 FILE_PUBLIC_BASE_URL = os.getenv("FILE_PUBLIC_BASE_URL", "").rstrip("/")
 FILE_LINK_TTL_SECONDS = int(os.getenv("FILE_LINK_TTL_SECONDS", "900"))
+DEAD_LETTER_QUEUE_NAME = os.getenv("QUERY_DEAD_LETTER_QUEUE_NAME", "painel-consulta:dead-letter")
 
 
 def b64url_encode(value: bytes) -> str:
@@ -90,3 +101,79 @@ async def refresh_attachment_link(query_id: str, attachment_id: str, user: dict 
         "download_url": f"{FILE_PUBLIC_BASE_URL}/files/{token}",
         "expires_in": FILE_LINK_TTL_SECONDS,
     }
+
+
+@app.get("/api/admin/operations")
+async def admin_operations(_: dict = Depends(admin_user)) -> dict:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        heartbeat_raw = await client.get(WORKER_HEARTBEAT_KEY)
+        heartbeat = json.loads(heartbeat_raw) if heartbeat_raw else None
+        dead_raw = await client.lrange(DEAD_LETTER_QUEUE_NAME, 0, 19)
+        dead_items: list[dict] = []
+        for position, raw in enumerate(dead_raw):
+            try:
+                job = json.loads(raw)
+            except json.JSONDecodeError:
+                job = {"raw": raw, "invalid": True}
+            dead_items.append({
+                "position": position,
+                "id": job.get("id"),
+                "command": job.get("command"),
+                "requested_by": job.get("requested_by_name") or job.get("requested_by"),
+                "batch_id": job.get("batch_id"),
+                "attempts": job.get("attempts") or job.get("attempt"),
+                "error": job.get("final_error") or job.get("last_error"),
+                "failed_at": job.get("failed_at"),
+                "invalid": bool(job.get("invalid")),
+            })
+        return {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "worker": "online" if heartbeat else "offline",
+            "worker_details": heartbeat,
+            "queue_waiting": await client.llen(QUEUE_NAME),
+            "queue_processing": await client.llen(PROCESSING_QUEUE_NAME),
+            "dead_letter_total": await client.llen(DEAD_LETTER_QUEUE_NAME),
+            "dead_letter_items": dead_items,
+        }
+    finally:
+        await client.aclose()
+
+
+@app.post("/api/admin/dead-letter/{position}/retry")
+async def retry_dead_letter(position: int, _: dict = Depends(admin_user)) -> dict:
+    if position < 0:
+        raise HTTPException(status_code=400, detail="Posição inválida")
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        raw = await client.lindex(DEAD_LETTER_QUEUE_NAME, position)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Item não encontrado na fila de falhas")
+        try:
+            job = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=409, detail="Item inválido não pode ser reenviado") from exc
+        job["attempt"] = 0
+        job.pop("final_error", None)
+        job.pop("failed_at", None)
+        job["manual_retry_at"] = datetime.now(timezone.utc).isoformat()
+        if job.get("id"):
+            await client.hset(query_key(str(job["id"])), mapping={"status": "QUEUED", "error": "", "attempts": 0})
+        pipe = client.pipeline()
+        pipe.lset(DEAD_LETTER_QUEUE_NAME, position, "__REMOVER__")
+        pipe.lrem(DEAD_LETTER_QUEUE_NAME, 1, "__REMOVER__")
+        pipe.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
+        await pipe.execute()
+        return {"status": "requeued", "id": job.get("id"), "command": job.get("command")}
+    finally:
+        await client.aclose()
+
+
+@app.delete("/api/admin/dead-letter")
+async def clear_dead_letter(_: dict = Depends(admin_user)) -> dict:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        removed = await client.delete(DEAD_LETTER_QUEUE_NAME)
+        return {"status": "cleared", "removed": bool(removed)}
+    finally:
+        await client.aclose()
