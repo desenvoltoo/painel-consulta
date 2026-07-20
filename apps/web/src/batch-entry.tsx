@@ -19,7 +19,8 @@ function mount(attempt = 0) {
   window.clearTimeout(timer);
   timer = window.setTimeout(() => {
     const host = document.querySelector<HTMLElement>('.active-batch');
-    if (!host || !latestBatch) {
+    const batch = latestBatch;
+    if (!host || !batch) {
       if (attempt < 20) mount(attempt + 1);
       return;
     }
@@ -31,12 +32,14 @@ function mount(attempt = 0) {
       host.appendChild(container);
     }
 
-    if (mountedHost !== container) {
+    if (mountedHost !== container || root === null) {
       root?.unmount();
       root = createRoot(container);
       mountedHost = container;
     }
-    root.render(<BatchWorkspace batch={latestBatch as any}/>);
+
+    const activeRoot = root;
+    activeRoot.render(<BatchWorkspace batch={batch as any}/>);
   }, attempt ? 100 : 0);
 }
 
