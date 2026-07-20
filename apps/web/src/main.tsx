@@ -1,8 +1,9 @@
-import React, { FormEvent, useEffect, useState } from 'react';
+import React, { FormEvent, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, ChevronDown, Clock3, Copy, Download, FileSpreadsheet, FileText, History, Layers3, LogOut, RefreshCw, Search, Send, ShieldCheck, Sparkles, XCircle } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import './styles.css';
+import './result-fields.css';
 
 type QueryStatus = 'idle' | 'loading' | 'success' | 'error';
 type ViewName = 'search' | 'batch' | 'history' | 'exports';
@@ -10,6 +11,8 @@ type User = { name: string; email: string; role: string };
 type QueryResult = { id: string; command: string; status: string; content: string; error?: string | null; createdAt: string; finishedAt?: string | null; elapsedMs: number; requestedBy: string; requestedByEmail: string; batchId?: string | null };
 type Batch = { id: string; commandPrefix: string; status: string; total: number; queued: number; processing: number; completed: number; failed: number; cancelled: number; createdAt: string; updatedAt: string; requestedBy: string; requestedByEmail: string; items: QueryResult[] };
 type CommandOption = { command: string; label: string; description: string; placeholder: string; inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode']; format: (value: string) => string; clean: (value: string) => string };
+type ParsedField = { id: string; label: string; value: string; section: string };
+type ParsedListRow = { id: string; index: string; columns: string[] };
 
 const TOKEN_KEY = 'painel-consulta-token';
 const digits = (value: string) => value.replace(/\D/g, '');
@@ -34,55 +37,46 @@ const commandOptions: CommandOption[] = [
   { command: '/cnpj', label: 'CNPJ', description: 'Buscar empresa por CNPJ', placeholder: '00.000.000/0000-00', inputMode: 'numeric', format: formatCnpj, clean: digits },
 ];
 
-function mapQuery(data: any): QueryResult {
-  return { id: data.id, command: data.command, status: data.status, content: data.content || '', error: data.error, createdAt: data.created_at, finishedAt: data.finished_at, elapsedMs: data.elapsed_ms || 0, requestedBy: data.requested_by, requestedByEmail: data.requested_by_email, batchId: data.batch_id };
-}
-function mapBatch(data: any): Batch {
-  return { id: data.id, commandPrefix: data.command_prefix, status: data.status, total: data.total, queued: data.queued, processing: data.processing, completed: data.completed, failed: data.failed, cancelled: data.cancelled, createdAt: data.created_at, updatedAt: data.updated_at, requestedBy: data.requested_by, requestedByEmail: data.requested_by_email, items: (data.items || []).map(mapQuery) };
-}
-function displayCommand(command: string) {
-  const option = commandOptions.find(item => command.startsWith(`${item.command} `) || command === item.command);
-  return option ? `${option.label}: ${command.slice(option.command.length).trim()}` : command;
-}
-function queryRow(result: QueryResult) {
-  return {
-    Consulta: displayCommand(result.command),
-    Status: result.status,
-    Usuario: result.requestedBy,
-    Email: result.requestedByEmail,
-    Data: new Date(result.createdAt).toLocaleString('pt-BR'),
-    Tempo_segundos: Number((result.elapsedMs / 1000).toFixed(2)),
-    Resultado_original: result.content || result.error || '',
-  };
-}
-function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = filename; anchor.click(); URL.revokeObjectURL(url);
-}
-function exportTxt(result: QueryResult) {
-  const row = queryRow(result);
-  const body = `Consulta: ${row.Consulta}\nStatus: ${row.Status}\nUsuário: ${row.Usuario}\nE-mail: ${row.Email}\nData: ${row.Data}\nTempo: ${row.Tempo_segundos}s\n\n${row.Resultado_original}`;
-  saveBlob(new Blob([body], { type: 'text/plain;charset=utf-8' }), `consulta-${result.id}.txt`);
-}
-function csvEscape(value: unknown) { return `"${String(value ?? '').replace(/"/g, '""')}"`; }
-function exportCsv(results: QueryResult[], filename: string) {
-  const rows = results.map(queryRow); const headers = Object.keys(rows[0] || queryRow({} as QueryResult));
-  const csv = '\uFEFF' + [headers.map(csvEscape).join(';'), ...rows.map(row => headers.map(key => csvEscape((row as any)[key])).join(';'))].join('\n');
-  saveBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), filename);
-}
-function exportXlsx(results: QueryResult[], filename: string) {
-  const workbook = XLSX.utils.book_new();
-  const summary = XLSX.utils.json_to_sheet(results.map(result => ({ ...queryRow(result), Resultado_original: result.content || result.error || '' })));
-  summary['!cols'] = [{ wch: 32 }, { wch: 18 }, { wch: 18 }, { wch: 34 }, { wch: 22 }, { wch: 16 }, { wch: 90 }];
-  XLSX.utils.book_append_sheet(workbook, summary, 'Consultas');
-  results.forEach((result, index) => {
-    const raw = XLSX.utils.aoa_to_sheet([
-      ['Consulta', displayCommand(result.command)], ['Status', result.status], ['Usuário', result.requestedBy], ['Data', new Date(result.createdAt).toLocaleString('pt-BR')], ['Resultado original'], [result.content || result.error || ''],
-    ]);
-    raw['!cols'] = [{ wch: 24 }, { wch: 100 }];
-    XLSX.utils.book_append_sheet(workbook, raw, `Resultado ${index + 1}`.slice(0, 31));
+function mapQuery(data: any): QueryResult { return { id: data.id, command: data.command, status: data.status, content: data.content || '', error: data.error, createdAt: data.created_at, finishedAt: data.finished_at, elapsedMs: data.elapsed_ms || 0, requestedBy: data.requested_by, requestedByEmail: data.requested_by_email, batchId: data.batch_id }; }
+function mapBatch(data: any): Batch { return { id: data.id, commandPrefix: data.command_prefix, status: data.status, total: data.total, queued: data.queued, processing: data.processing, completed: data.completed, failed: data.failed, cancelled: data.cancelled, createdAt: data.created_at, updatedAt: data.updated_at, requestedBy: data.requested_by, requestedByEmail: data.requested_by_email, items: (data.items || []).map(mapQuery) }; }
+function displayCommand(command: string) { const option = commandOptions.find(item => command.startsWith(`${item.command} `) || command === item.command); return option ? `${option.label}: ${command.slice(option.command.length).trim()}` : command; }
+
+function parseResult(content: string): { fields: ParsedField[]; listRows: ParsedListRow[] } {
+  let section = 'Informações';
+  const fields: ParsedField[] = [];
+  const listRows: ParsedListRow[] = [];
+  content.split(/\r?\n/).forEach((rawLine, lineIndex) => {
+    const line = rawLine.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    if (!line) return;
+    const heading = line.match(/^(?:>{1,3}|#{1,3})\s*(.+)$/);
+    if (heading) { section = heading[1].trim() || section; return; }
+    if (/^[-=_]{3,}$/.test(line)) return;
+    const listMatch = line.match(/^(\d+)\s*(?:->|→|[-–—])\s*(.+)$/);
+    if (listMatch) {
+      const columns = listMatch[2].split('|').map(item => item.trim()).filter(Boolean);
+      listRows.push({ id: `list-${lineIndex}`, index: listMatch[1], columns: columns.length ? columns : [listMatch[2].trim()] });
+      return;
+    }
+    const separators = [':', '→', '->'];
+    for (const separator of separators) {
+      const position = line.indexOf(separator);
+      if (position > 0) {
+        const label = line.slice(0, position).replace(/^[-•*]+\s*/, '').trim();
+        const value = line.slice(position + separator.length).trim();
+        if (label && value && label.length <= 80) fields.push({ id: `field-${lineIndex}`, label, value, section });
+        return;
+      }
+    }
   });
-  XLSX.writeFile(workbook, filename);
+  return { fields, listRows };
 }
+
+function queryRow(result: QueryResult) { return { Consulta: displayCommand(result.command), Status: result.status, Usuario: result.requestedBy, Email: result.requestedByEmail, Data: new Date(result.createdAt).toLocaleString('pt-BR'), Tempo_segundos: Number((result.elapsedMs / 1000).toFixed(2)), Resultado_original: result.content || result.error || '' }; }
+function saveBlob(blob: Blob, filename: string) { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = filename; anchor.click(); URL.revokeObjectURL(url); }
+function exportTxt(result: QueryResult) { const row = queryRow(result); const body = `Consulta: ${row.Consulta}\nStatus: ${row.Status}\nUsuário: ${row.Usuario}\nE-mail: ${row.Email}\nData: ${row.Data}\nTempo: ${row.Tempo_segundos}s\n\n${row.Resultado_original}`; saveBlob(new Blob([body], { type: 'text/plain;charset=utf-8' }), `consulta-${result.id}.txt`); }
+function csvEscape(value: unknown) { return `"${String(value ?? '').replace(/"/g, '""')}"`; }
+function exportCsv(results: QueryResult[], filename: string) { const rows = results.map(queryRow); if (!rows.length) return; const headers = Object.keys(rows[0]); const csv = '\uFEFF' + [headers.map(csvEscape).join(';'), ...rows.map(row => headers.map(key => csvEscape((row as any)[key])).join(';'))].join('\n'); saveBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), filename); }
+function exportXlsx(results: QueryResult[], filename: string) { if (!results.length) return; const workbook = XLSX.utils.book_new(); const summary = XLSX.utils.json_to_sheet(results.map(queryRow)); summary['!cols'] = [{ wch: 32 }, { wch: 18 }, { wch: 18 }, { wch: 34 }, { wch: 22 }, { wch: 16 }, { wch: 90 }]; XLSX.utils.book_append_sheet(workbook, summary, 'Consultas'); results.forEach((item, index) => { const parsed = parseResult(item.content || ''); const rows = parsed.fields.length ? parsed.fields.map(field => [field.section, field.label, field.value]) : [['Resultado original', '', item.content || item.error || '']]; const sheet = XLSX.utils.aoa_to_sheet([['Seção', 'Campo', 'Valor'], ...rows]); sheet['!cols'] = [{ wch: 24 }, { wch: 30 }, { wch: 90 }]; XLSX.utils.book_append_sheet(workbook, sheet, `Resultado ${index + 1}`.slice(0, 31)); }); XLSX.writeFile(workbook, filename); }
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY) || '');
@@ -91,6 +85,8 @@ function App() {
   const [view, setView] = useState<ViewName>('search'); const [selectedCommand, setSelectedCommand] = useState('/cpf'); const [searchValue, setSearchValue] = useState(''); const [batchValues, setBatchValues] = useState('');
   const [status, setStatus] = useState<QueryStatus>('idle'); const [result, setResult] = useState<QueryResult | null>(null); const [errorMessage, setErrorMessage] = useState(''); const [copiedId, setCopiedId] = useState('');
   const [history, setHistory] = useState<QueryResult[]>([]); const [batches, setBatches] = useState<Batch[]>([]); const [activeBatch, setActiveBatch] = useState<Batch | null>(null);
+  const parsedResult = useMemo(() => parseResult(result?.content || ''), [result?.content]);
+  const groupedFields = useMemo(() => parsedResult.fields.reduce<Record<string, ParsedField[]>>((groups, field) => { (groups[field.section] ||= []).push(field); return groups; }, {}), [parsedResult.fields]);
 
   function authHeaders() { return { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }; }
   function logout() { localStorage.removeItem(TOKEN_KEY); setToken(''); setUser(null); setHistory([]); setBatches([]); setActiveBatch(null); }
@@ -99,7 +95,6 @@ function App() {
   async function loadHistory() { if (!token) return; const data = await api('/api/history?limit=200'); setHistory(data.map(mapQuery)); }
   async function loadBatches() { if (!token) return; const data = await api('/api/batches?limit=50'); setBatches(data.map(mapBatch)); }
   async function loadBatch(id: string) { const data = await api(`/api/batches/${id}`); const batch = mapBatch(data); setActiveBatch(batch); setBatches(previous => [batch, ...previous.filter(item => item.id !== batch.id)]); if (!['COMPLETED', 'COMPLETED_WITH_ERRORS', 'CANCELLED'].includes(batch.status)) window.setTimeout(() => loadBatch(id).catch(() => undefined), 2000); else loadHistory().catch(() => undefined); }
-
   useEffect(() => { if (!token) return; fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } }).then(async response => { if (!response.ok) throw new Error(); return response.json(); }).then(data => { setUser(data); loadHistory().catch(() => undefined); loadBatches().catch(() => undefined); }).catch(logout); }, [token]);
 
   const selectedOption = commandOptions.find(item => item.command === selectedCommand) || commandOptions[0];
@@ -113,17 +108,15 @@ function App() {
 
   const progress = activeBatch ? Math.round(((activeBatch.completed + activeBatch.failed + activeBatch.cancelled) / Math.max(activeBatch.total, 1)) * 100) : 0;
   const completedHistory = history.filter(item => item.status === 'COMPLETED');
-
-  return <div className="app-shell compact-sidebar"><aside className="sidebar"><div className="brand"><div className="brand-mark"><Sparkles size={21}/></div><div><strong>Referência</strong><span>Consulta inteligente</span></div></div><nav className="main-nav"><button className={`nav-item ${view === 'search' ? 'active' : ''}`} onClick={() => setView('search')}><Search size={19}/><span>Nova consulta</span></button><button className={`nav-item ${view === 'batch' ? 'active' : ''}`} onClick={() => setView('batch')}><Layers3 size={19}/><span>Consulta em lote</span></button><button className={`nav-item ${view === 'history' ? 'active' : ''}`} onClick={() => { setView('history'); loadHistory(); }}><History size={19}/><span>Histórico</span><span className="nav-count">{history.length}</span></button><button className={`nav-item ${view === 'exports' ? 'active' : ''}`} onClick={() => setView('exports')}><FileText size={19}/><span>Exportações</span></button></nav><div className="user-card"><div className="avatar">{user.name.slice(0,2).toUpperCase()}</div><div><strong>{user.name}</strong><span>{user.role}</span></div><button title="Sair" onClick={logout}><LogOut size={18}/></button></div></aside><main className="content"><header className="topbar"><div><p className="eyebrow">PAINEL DE CONSULTAS</p><h1>{view === 'search' ? 'Buscar informações.' : view === 'batch' ? 'Consulta em lote.' : view === 'history' ? 'Histórico central.' : 'Central de exportações.'}</h1><p className="subtitle">Os resultados são exibidos e exportados exatamente como recebidos do Telegram.</p></div><div className="status-pill"><span></span>{user.name} conectado</div></header>
+  return <div className="app-shell compact-sidebar"><aside className="sidebar"><div className="brand"><div className="brand-mark"><Sparkles size={21}/></div><div><strong>Referência</strong><span>Consulta inteligente</span></div></div><nav className="main-nav"><button className={`nav-item ${view === 'search' ? 'active' : ''}`} onClick={() => setView('search')}><Search size={19}/><span>Nova consulta</span></button><button className={`nav-item ${view === 'batch' ? 'active' : ''}`} onClick={() => setView('batch')}><Layers3 size={19}/><span>Consulta em lote</span></button><button className={`nav-item ${view === 'history' ? 'active' : ''}`} onClick={() => { setView('history'); loadHistory(); }}><History size={19}/><span>Histórico</span><span className="nav-count">{history.length}</span></button><button className={`nav-item ${view === 'exports' ? 'active' : ''}`} onClick={() => setView('exports')}><FileText size={19}/><span>Exportações</span></button></nav><div className="user-card"><div className="avatar">{user.name.slice(0,2).toUpperCase()}</div><div><strong>{user.name}</strong><span>{user.role}</span></div><button title="Sair" onClick={logout}><LogOut size={18}/></button></div></aside><main className="content"><header className="topbar"><div><p className="eyebrow">PAINEL DE CONSULTAS</p><h1>{view === 'search' ? 'Buscar informações.' : view === 'batch' ? 'Consulta em lote.' : view === 'history' ? 'Histórico central.' : 'Central de exportações.'}</h1><p className="subtitle">Os campos identificados podem ser copiados individualmente.</p></div><div className="status-pill"><span></span>{user.name} conectado</div></header>
 
   {(view === 'search' || view === 'batch') && <section className="hero-card search-panel"><div className="hero-copy"><div className="hero-icon">{view === 'batch' ? <Layers3 size={22}/> : <Send size={22}/>}</div><div><h2>{view === 'batch' ? 'Nova consulta em lote' : 'Nova consulta'}</h2><p>Selecione o tipo e preencha os valores.</p></div></div><div className="search-type-row"><label>Tipo de consulta</label><div className="select-wrap"><select value={selectedCommand} onChange={e => { setSelectedCommand(e.target.value); setSearchValue(''); }}><>{commandOptions.map(option => <option key={option.command} value={option.command}>{option.label} — {option.description}</option>)}</></select><ChevronDown size={18}/></div></div>{view === 'search' ? <form onSubmit={runQuery} className="query-form"><label>{selectedOption.label}</label><div className="query-row"><div className="input-wrap"><Search size={20}/><input value={searchValue} onChange={e => setSearchValue(selectedOption.format(e.target.value))} placeholder={selectedOption.placeholder} inputMode={selectedOption.inputMode}/></div><button className="primary-button" disabled={status === 'loading'}>{status === 'loading' ? 'Consultando...' : `Buscar ${selectedOption.label}`}</button></div></form> : <form onSubmit={runBatch} className="query-form"><label>Valores, um por linha</label><textarea className="batch-textarea" value={batchValues} onChange={e => setBatchValues(e.target.value)} placeholder={`${selectedOption.placeholder}\n${selectedOption.placeholder}\n${selectedOption.placeholder}`}/><div className="batch-footer"><span>{batchValues.split(/\r?\n/).filter(Boolean).length} item(ns)</span><button className="primary-button" disabled={status === 'loading'}>{status === 'loading' ? 'Criando lote...' : 'Iniciar lote'}</button></div></form>}{status === 'error' && <div className="login-error">{errorMessage}</div>}</section>}
 
   {view === 'batch' && <section className="page-card batch-monitor"><div className="page-card-header"><div><h2>Lotes recentes</h2><p>Acompanhe progresso, falhas e cancelamentos.</p></div><button className="secondary-button" onClick={loadBatches}><RefreshCw size={16}/>Atualizar</button></div>{activeBatch && <div className="active-batch"><div className="batch-summary"><div><strong>{displayCommand(`${activeBatch.commandPrefix} lote`)}</strong><small>{activeBatch.requestedBy} · {new Date(activeBatch.createdAt).toLocaleString('pt-BR')}</small></div><span className={`batch-status ${activeBatch.status.toLowerCase()}`}>{activeBatch.status}</span></div><div className="batch-progress"><span style={{width: `${progress}%`}}/></div><div className="batch-counters"><span>{progress}%</span><span>{activeBatch.completed} concluídas</span><span>{activeBatch.failed} falhas</span><span>{activeBatch.processing} em andamento</span><span>{activeBatch.queued} na fila</span></div><div className="batch-actions">{activeBatch.items.length > 0 && <><button className="secondary-button" onClick={() => exportCsv(activeBatch.items, `lote-${activeBatch.id}.csv`)}><FileText size={16}/>CSV</button><button className="secondary-button" onClick={() => exportXlsx(activeBatch.items, `lote-${activeBatch.id}.xlsx`)}><FileSpreadsheet size={16}/>Excel</button></>}{!['COMPLETED','COMPLETED_WITH_ERRORS','CANCELLED'].includes(activeBatch.status) && <button className="danger-button" onClick={() => cancelBatch(activeBatch.id)}><XCircle size={16}/>Cancelar lote</button>}{activeBatch.failed > 0 && ['COMPLETED_WITH_ERRORS','COMPLETED'].includes(activeBatch.status) && <button className="secondary-button" onClick={() => retryBatch(activeBatch.id)}><RefreshCw size={16}/>Repetir falhas</button>}</div><div className="batch-items">{activeBatch.items.map(item => <button key={item.id} onClick={() => { setResult(item); setView('search'); setStatus(item.status === 'FAILED' ? 'error' : 'success'); }}><span>{displayCommand(item.command)}</span><em>{item.status}</em></button>)}</div></div>}<div className="history-list">{batches.map(batch => <article className="history-item" key={batch.id}><button className="history-main" onClick={() => loadBatch(batch.id)}><span><strong>{displayCommand(`${batch.commandPrefix} lote`)}</strong><small>{batch.requestedBy} · {new Date(batch.createdAt).toLocaleString('pt-BR')} · {batch.completed}/{batch.total}</small></span></button><span className={`batch-status ${batch.status.toLowerCase()}`}>{batch.status}</span></article>)}</div></section>}
 
-  {view === 'search' && <><section className="metrics-grid"><article><span className="metric-icon violet"><Activity size={20}/></span><div><small>Histórico central</small><strong>{history.length}</strong></div><em>Servidor</em></article><article><span className="metric-icon blue"><Clock3 size={20}/></span><div><small>Último tempo</small><strong>{result ? `${(result.elapsedMs/1000).toFixed(1)}s` : '—'}</strong></div><em>API</em></article><article><span className="metric-icon green"><ShieldCheck size={20}/></span><div><small>Usuário</small><strong>{user.name}</strong></div><em>{user.role}</em></article></section><section className="result-card"><div className="result-header"><div><span className={`result-status ${status}`}>{status === 'loading' ? 'PROCESSANDO' : result ? result.status : 'AGUARDANDO'}</span><h2>Resultado da consulta</h2></div>{result && <div className="result-actions"><button className="secondary-button" onClick={() => copyValue('all', result.content || result.error || '')}><Copy size={17}/>{copiedId === 'all' ? 'Copiado' : 'Copiar tudo'}</button><button className="secondary-button" onClick={() => exportTxt(result)}><FileText size={17}/>TXT</button><button className="secondary-button" onClick={() => exportCsv([result], `consulta-${result.id}.csv`)}><Download size={17}/>CSV</button><button className="secondary-button" onClick={() => exportXlsx([result], `consulta-${result.id}.xlsx`)}><FileSpreadsheet size={17}/>Excel</button></div>}</div>{result ? <div className="result-body">{result.error && <div className="login-error">{result.error}</div>}<pre>{result.content || result.error || ''}</pre></div> : <div className="empty-state"><div><Search size={28}/></div><h3>Nenhuma consulta realizada</h3></div>}</section></>}
+  {view === 'search' && <><section className="metrics-grid"><article><span className="metric-icon violet"><Activity size={20}/></span><div><small>Histórico central</small><strong>{history.length}</strong></div><em>Servidor</em></article><article><span className="metric-icon blue"><Clock3 size={20}/></span><div><small>Último tempo</small><strong>{result ? `${(result.elapsedMs/1000).toFixed(1)}s` : '—'}</strong></div><em>API</em></article><article><span className="metric-icon green"><ShieldCheck size={20}/></span><div><small>Usuário</small><strong>{user.name}</strong></div><em>{user.role}</em></article></section><section className="result-card"><div className="result-header"><div><span className={`result-status ${status}`}>{status === 'loading' ? 'PROCESSANDO' : result ? result.status : 'AGUARDANDO'}</span><h2>Resultado da consulta</h2></div>{result && <div className="result-actions"><button className="secondary-button" onClick={() => copyValue('all', result.content || result.error || '')}><Copy size={17}/>{copiedId === 'all' ? 'Copiado' : 'Copiar tudo'}</button><button className="secondary-button" onClick={() => exportTxt(result)}><FileText size={17}/>TXT</button><button className="secondary-button" onClick={() => exportCsv([result], `consulta-${result.id}.csv`)}><Download size={17}/>CSV</button><button className="secondary-button" onClick={() => exportXlsx([result], `consulta-${result.id}.xlsx`)}><FileSpreadsheet size={17}/>Excel</button></div>}</div>{result ? <div className="result-body">{result.error && <div className="login-error">{result.error}</div>}{parsedResult.listRows.length > 0 && <div className="copy-list">{parsedResult.listRows.map(row => <article className="copy-list-row" key={row.id}><span className="copy-list-index">{row.index}</span><div className="copy-list-columns">{row.columns.map((column, columnIndex) => <div className="copy-cell" key={`${row.id}-${columnIndex}`}><span>{column}</span><button title="Copiar campo" onClick={() => copyValue(`${row.id}-${columnIndex}`, column)}><Copy size={15}/>{copiedId === `${row.id}-${columnIndex}` && <em>Copiado</em>}</button></div>)}</div></article>)}</div>}{parsedResult.listRows.length === 0 && parsedResult.fields.length > 0 && <div className="copy-sections">{Object.entries(groupedFields).map(([section, fields]) => <section className="copy-section" key={section}><h3>{section}</h3><div className="copy-grid">{fields.map(field => <article className="copy-field" key={field.id}><div><small>{field.label}</small><strong>{field.value}</strong></div><button title="Copiar campo" onClick={() => copyValue(field.id, field.value)}><Copy size={16}/><span>{copiedId === field.id ? 'Copiado' : 'Copiar'}</span></button></article>)}</div></section>)}</div>}{parsedResult.listRows.length === 0 && parsedResult.fields.length === 0 && <pre>{result.content || result.error || ''}</pre>}{(parsedResult.listRows.length > 0 || parsedResult.fields.length > 0) && <details className="raw-result"><summary>Ver resposta original</summary><pre>{result.content || result.error || ''}</pre></details>}</div> : <div className="empty-state"><div><Search size={28}/></div><h3>Nenhuma consulta realizada</h3></div>}</section></>}
 
   {view === 'history' && <section className="page-card"><div className="page-card-header"><div><h2>Consultas anteriores</h2><p>{history.length} resultado(s) salvos no servidor.</p></div><button className="secondary-button" onClick={loadHistory}><RefreshCw size={16}/>Atualizar</button></div>{history.length === 0 ? <div className="empty-state"><h3>Histórico vazio</h3></div> : <div className="history-list">{history.map(item => <article className="history-item" key={item.id}><button className="history-main" onClick={() => { setResult(item); setView('search'); setStatus(item.status === 'FAILED' ? 'error' : 'success'); }}><span><strong>{displayCommand(item.command)}</strong><small>{new Date(item.createdAt).toLocaleString('pt-BR')} · {item.requestedBy} · {item.status}</small></span></button><div className="history-actions"><button onClick={() => copyValue(`h-${item.id}`, item.content || item.error || '')}><Copy size={16}/></button><button onClick={() => exportXlsx([item], `consulta-${item.id}.xlsx`)}><FileSpreadsheet size={16}/></button></div></article>)}</div>}</section>}
-
   {view === 'exports' && <section className="page-card"><div className="page-card-header"><div><h2>Arquivos disponíveis</h2><p>Exporte os resultados sem alterar o conteúdo original.</p></div>{completedHistory.length > 0 && <div className="result-actions"><button className="secondary-button" onClick={() => exportCsv(completedHistory, 'historico-consultas.csv')}><FileText size={16}/>Todo histórico CSV</button><button className="secondary-button" onClick={() => exportXlsx(completedHistory, 'historico-consultas.xlsx')}><FileSpreadsheet size={16}/>Todo histórico Excel</button></div>}</div><div className="export-grid">{completedHistory.map(item => <article className="export-card" key={item.id}><span className="export-icon"><FileText size={22}/></span><div><strong>{displayCommand(item.command)}</strong><small>{new Date(item.createdAt).toLocaleString('pt-BR')} · {item.requestedBy}</small></div><div className="result-actions"><button className="secondary-button" onClick={() => exportTxt(item)}>TXT</button><button className="secondary-button" onClick={() => exportXlsx([item], `consulta-${item.id}.xlsx`)}>Excel</button></div></article>)}</div></section>}
   </main></div>;
 }
