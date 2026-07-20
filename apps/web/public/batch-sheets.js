@@ -1,11 +1,6 @@
 (() => {
-  const state = { batch: null, activeId: null, mountedFor: null };
+  const state = { batch: null, activeId: null, mountTimer: null };
   const originalFetch = window.fetch.bind(window);
-
-  function mapBatch(data) {
-    if (!data || !data.id || !Array.isArray(data.items)) return null;
-    return data;
-  }
 
   function escapeHtml(value) {
     return String(value ?? '')
@@ -16,151 +11,125 @@
       .replaceAll("'", '&#039;');
   }
 
-  function commandLabel(command) {
-    const parts = String(command || '').trim().split(/\s+/, 2);
-    return parts.length > 1 ? parts[1] : command || 'Consulta';
+  function valueFromCommand(command) {
+    const text = String(command || '').trim();
+    const firstSpace = text.indexOf(' ');
+    return firstSpace >= 0 ? text.slice(firstSpace + 1) : text || 'Consulta';
   }
 
   function statusClass(status) {
     return String(status || '').toLowerCase().replaceAll('_', '-');
   }
 
-  function parseRows(content) {
-    const rows = [];
-    const text = String(content || '');
-    text.split(/\r?\n/).forEach((raw) => {
+  function parseFields(content) {
+    const fields = [];
+    String(content || '').split(/\r?\n/).forEach((raw) => {
       const line = raw.trim();
       if (!line) return;
-      const list = line.match(/^(\d+)\s*(?:->|→|[-–—])\s*(.+)$/);
-      if (list) {
-        const cols = list[2].split('|').map((item) => item.trim()).filter(Boolean);
-        rows.push({ label: `Item ${list[1]}`, value: cols.join(' | ') });
-        return;
-      }
       for (const separator of [':', '→', '->']) {
         const index = line.indexOf(separator);
         if (index > 0) {
           const label = line.slice(0, index).replace(/^[-•*]+\s*/, '').trim();
           const value = line.slice(index + separator.length).trim();
-          if (label && value && label.length < 90) rows.push({ label, value });
+          if (label && value && label.length <= 80) fields.push({ label, value });
           return;
         }
       }
     });
-    return rows;
+    return fields;
   }
 
-  function copyText(value, button) {
-    navigator.clipboard.writeText(value).then(() => {
-      const old = button.textContent;
+  function copy(value, button) {
+    navigator.clipboard.writeText(value || '').then(() => {
+      const original = button.textContent;
       button.textContent = 'Copiado';
-      setTimeout(() => { button.textContent = old; }, 1200);
+      setTimeout(() => { button.textContent = original; }, 1000);
     });
-  }
-
-  function downloadText(item) {
-    const content = [
-      `Consulta: ${item.command || ''}`,
-      `Status: ${item.status || ''}`,
-      `Usuário: ${item.requested_by || ''}`,
-      `Data: ${item.created_at ? new Date(item.created_at).toLocaleString('pt-BR') : ''}`,
-      '',
-      item.content || item.error || ''
-    ].join('\n');
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `consulta-${item.id}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   function render() {
     const host = document.querySelector('.active-batch');
-    if (!host || !state.batch) return;
+    if (!host || !state.batch) return false;
 
-    const existing = host.querySelector('.batch-sheets-workspace');
-    if (existing && state.mountedFor === state.batch.id) {
-      updateWorkspace(existing);
-      return;
+    let box = host.querySelector('.simple-batch-tabs');
+    if (!box) {
+      box = document.createElement('section');
+      box.className = 'simple-batch-tabs';
+      host.appendChild(box);
     }
-    existing?.remove();
 
-    const workspace = document.createElement('section');
-    workspace.className = 'batch-sheets-workspace';
-    host.appendChild(workspace);
-    state.mountedFor = state.batch.id;
-    if (!state.activeId || !state.batch.items.some((item) => item.id === state.activeId)) {
-      state.activeId = state.batch.items[0]?.id || null;
+    const items = state.batch.items || [];
+    if (!items.some((item) => item.id === state.activeId)) {
+      state.activeId = items[0]?.id || null;
     }
-    updateWorkspace(workspace);
-  }
-
-  function updateWorkspace(workspace) {
-    const batch = state.batch;
-    if (!batch) return;
-    const items = batch.items || [];
     const active = items.find((item) => item.id === state.activeId) || items[0];
-    const rows = active ? parseRows(active.content) : [];
+    const fields = active ? parseFields(active.content) : [];
 
-    workspace.innerHTML = `
-      <div class="batch-sheets-toolbar">
+    box.innerHTML = `
+      <div class="simple-batch-title">
         <div>
-          <strong>Planilha do lote</strong>
-          <span>${items.length} consulta(s) — cada aba representa uma consulta</span>
+          <strong>Resultados do lote</strong>
+          <span>Clique em uma aba para ver a consulta.</span>
         </div>
-        <div class="batch-sheets-actions">
-          ${active ? '<button type="button" data-action="copy-all">Copiar resultado</button><button type="button" data-action="download">Baixar TXT</button>' : ''}
-        </div>
+        <span>${items.length} item(ns)</span>
       </div>
-      <div class="batch-sheet-canvas">
-        ${active ? `
-          <div class="batch-sheet-titlebar">
-            <div><small>Consulta</small><strong>${escapeHtml(active.command || '')}</strong></div>
-            <span class="batch-sheet-status ${statusClass(active.status)}">${escapeHtml(active.status || '')}</span>
-          </div>
-          <div class="batch-sheet-grid">
-            <div class="batch-sheet-row batch-sheet-head"><span>Campo</span><span>Valor</span><span>Ação</span></div>
-            ${rows.length ? rows.map((row, index) => `
-              <div class="batch-sheet-row">
-                <span class="batch-sheet-label">${escapeHtml(row.label)}</span>
-                <span class="batch-sheet-value">${escapeHtml(row.value)}</span>
-                <button type="button" data-copy-index="${index}">Copiar</button>
-              </div>`).join('') : `
-              <div class="batch-sheet-empty">
-                <strong>${active.status === 'COMPLETED' ? 'Resposta original' : 'Consulta ainda não concluída'}</strong>
-                <pre>${escapeHtml(active.content || active.error || 'Aguardando processamento...')}</pre>
-              </div>`}
-          </div>
-        ` : '<div class="batch-sheet-empty"><strong>Nenhuma consulta no lote.</strong></div>'}
-      </div>
-      <div class="batch-sheet-tabs" role="tablist" aria-label="Consultas do lote">
+
+      <div class="simple-batch-tabbar">
         ${items.map((item, index) => `
-          <button type="button" class="batch-sheet-tab ${item.id === active?.id ? 'active' : ''}" data-query-id="${escapeHtml(item.id)}" role="tab">
-            <span class="batch-tab-dot ${statusClass(item.status)}"></span>
-            <span>${escapeHtml(commandLabel(item.command))}</span>
+          <button type="button" class="simple-batch-tab ${item.id === active?.id ? 'active' : ''}" data-id="${escapeHtml(item.id)}">
+            <span class="simple-status-dot ${statusClass(item.status)}"></span>
+            <span>${escapeHtml(valueFromCommand(item.command))}</span>
             <small>${index + 1}</small>
           </button>`).join('')}
       </div>
+
+      <div class="simple-batch-content">
+        ${active ? `
+          <div class="simple-batch-header">
+            <div>
+              <small>Consulta selecionada</small>
+              <strong>${escapeHtml(active.command || '')}</strong>
+            </div>
+            <span class="simple-status ${statusClass(active.status)}">${escapeHtml(active.status || '')}</span>
+          </div>
+          ${fields.length ? `
+            <div class="simple-fields">
+              ${fields.map((field, index) => `
+                <div class="simple-field-row">
+                  <div><small>${escapeHtml(field.label)}</small><strong>${escapeHtml(field.value)}</strong></div>
+                  <button type="button" data-copy="${index}">Copiar</button>
+                </div>`).join('')}
+            </div>` : `
+            <div class="simple-raw-result">
+              <p>${active.status === 'COMPLETED' ? 'Resposta da consulta' : 'Aguardando a conclusão desta consulta.'}</p>
+              <pre>${escapeHtml(active.content || active.error || 'Sem resultado ainda.')}</pre>
+            </div>`}
+        ` : '<div class="simple-raw-result"><p>Nenhuma consulta no lote.</p></div>'}
+      </div>
     `;
 
-    workspace.querySelectorAll('[data-query-id]').forEach((button) => {
+    box.querySelectorAll('[data-id]').forEach((button) => {
       button.addEventListener('click', () => {
-        state.activeId = button.getAttribute('data-query-id');
-        updateWorkspace(workspace);
+        state.activeId = button.getAttribute('data-id');
+        render();
       });
     });
-    workspace.querySelectorAll('[data-copy-index]').forEach((button) => {
+
+    box.querySelectorAll('[data-copy]').forEach((button) => {
       button.addEventListener('click', () => {
-        const row = rows[Number(button.getAttribute('data-copy-index'))];
-        if (row) copyText(row.value, button);
+        const field = fields[Number(button.getAttribute('data-copy'))];
+        if (field) copy(field.value, button);
       });
     });
-    workspace.querySelector('[data-action="copy-all"]')?.addEventListener('click', (event) => {
-      copyText(active.content || active.error || '', event.currentTarget);
-    });
-    workspace.querySelector('[data-action="download"]')?.addEventListener('click', () => downloadText(active));
+
+    return true;
+  }
+
+  function scheduleRender(attempt = 0) {
+    clearTimeout(state.mountTimer);
+    state.mountTimer = setTimeout(() => {
+      if (!render() && attempt < 12) scheduleRender(attempt + 1);
+    }, attempt === 0 ? 0 : 100);
   }
 
   window.fetch = async (...args) => {
@@ -169,19 +138,13 @@
       const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
       if (/\/api\/queries\/batch$/.test(url) || /\/api\/batches\/[^/?]+/.test(url)) {
         const data = await response.clone().json();
-        const batch = mapBatch(data);
-        if (batch) {
-          state.batch = batch;
-          if (!state.activeId) state.activeId = batch.items[0]?.id || null;
-          setTimeout(render, 0);
+        if (data?.id && Array.isArray(data.items)) {
+          state.batch = data;
+          if (!state.activeId) state.activeId = data.items[0]?.id || null;
+          scheduleRender();
         }
       }
     } catch (_) {}
     return response;
   };
-
-  const observer = new MutationObserver(() => {
-    if (document.querySelector('.active-batch')) render();
-  });
-  observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
