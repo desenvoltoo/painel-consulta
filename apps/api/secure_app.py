@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import logging
 import os
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -13,10 +13,13 @@ from jose import JWTError, jwt
 from app_wrapper import app
 from main import JWT_SECRET, REDIS_URL, admin_user
 
+logger = logging.getLogger("painel-consulta.audit")
+
 AUDIT_INDEX = "painel-consulta:audit"
 AUDIT_TTL_SECONDS = int(os.getenv("AUDIT_TTL_SECONDS", "7776000"))
 AUDIT_MAX_RECORDS = int(os.getenv("AUDIT_MAX_RECORDS", "10000"))
 AUDITED_PREFIXES = ("/api/auth/", "/api/admin/", "/api/batches/")
+AUDITED_EXACT_PATHS = {"/api/queries", "/api/queries/batch"}
 AUDITED_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
 
 
@@ -40,30 +43,9 @@ def actor_from_request(request: Request) -> tuple[str, str]:
         return "invalid-token", ""
 
 
-@app.middleware("http")
-async def audit_middleware(request: Request, call_next):
-    should_audit = request.method in AUDITED_METHODS and request.url.path.startswith(AUDITED_PREFIXES)
-    started_at = datetime.now(timezone.utc)
-    response = await call_next(request)
-    if not should_audit:
-        return response
-
-    actor, actor_email = actor_from_request(request)
-    event_id = str(uuid4())
-    finished_at = datetime.now(timezone.utc)
-    ip = request_ip(request)
-    record = {
-        "id": event_id,
-        "actor": actor,
-        "actor_email": actor_email,
-        "method": request.method,
-        "path": request.url.path,
-        "status_code": response.status_code,
-        "ip_hash": hashlib.sha256(ip.encode()).hexdigest(),
-        "created_at": started_at.isoformat(),
-        "elapsed_ms": round((finished_at - started_at).total_seconds() * 1000),
-    }
+async def save_audit_record(record: dict, started_at: datetime) -> None:
     client = redis.from_url(REDIS_URL, decode_responses=True)
+    event_id = str(record["id"])
     try:
         pipe = client.pipeline(transaction=False)
         pipe.hset(audit_key(event_id), mapping={key: str(value) for key, value in record.items()})
@@ -73,7 +55,49 @@ async def audit_middleware(request: Request, call_next):
         await pipe.execute()
     finally:
         await client.aclose()
-    return response
+
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    path = request.url.path
+    should_audit = request.method in AUDITED_METHODS and (
+        path.startswith(AUDITED_PREFIXES) or path in AUDITED_EXACT_PATHS
+    )
+    if not should_audit:
+        return await call_next(request)
+
+    started_at = datetime.now(timezone.utc)
+    status_code = 500
+    raised: Exception | None = None
+    response = None
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception as exc:
+        raised = exc
+        raise
+    finally:
+        actor, actor_email = actor_from_request(request)
+        finished_at = datetime.now(timezone.utc)
+        ip = request_ip(request)
+        record = {
+            "id": str(uuid4()),
+            "actor": actor,
+            "actor_email": actor_email,
+            "method": request.method,
+            "path": path,
+            "status_code": status_code,
+            "ip_hash": hashlib.sha256(ip.encode()).hexdigest(),
+            "created_at": started_at.isoformat(),
+            "elapsed_ms": round((finished_at - started_at).total_seconds() * 1000),
+            "outcome": "exception" if raised else "response",
+        }
+        try:
+            await save_audit_record(record, started_at)
+        except Exception:
+            logger.exception("Falha ao registrar auditoria para %s %s", request.method, path)
 
 
 @app.get("/api/admin/audit")
@@ -82,9 +106,14 @@ async def list_audit(limit: int = 100, _: dict = Depends(admin_user)) -> list[di
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         ids = await client.zrevrange(AUDIT_INDEX, 0, limit - 1)
-        result: list[dict] = []
+        if not ids:
+            return []
+        pipe = client.pipeline(transaction=False)
         for event_id in ids:
-            item = await client.hgetall(audit_key(event_id))
+            pipe.hgetall(audit_key(event_id))
+        raw_items = await pipe.execute()
+        result: list[dict] = []
+        for item in raw_items:
             if not item:
                 continue
             item["status_code"] = int(item.get("status_code", 0))
@@ -101,11 +130,12 @@ async def export_audit(_: dict = Depends(admin_user)) -> dict:
     try:
         total = await client.zcard(AUDIT_INDEX)
         latest_ids = await client.zrevrange(AUDIT_INDEX, 0, min(total, 1000) - 1) if total else []
-        records = []
+        if not latest_ids:
+            return {"generated_at": datetime.now(timezone.utc).isoformat(), "total": total, "records": []}
+        pipe = client.pipeline(transaction=False)
         for event_id in latest_ids:
-            item = await client.hgetall(audit_key(event_id))
-            if item:
-                records.append(item)
+            pipe.hgetall(audit_key(event_id))
+        records = [item for item in await pipe.execute() if item]
         return {"generated_at": datetime.now(timezone.utc).isoformat(), "total": total, "records": records}
     finally:
         await client.aclose()
