@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Referência Consulta</title>
+  <desc id="desc">Símbolo de consulta inteligente do Grupo Referência</desc>
+  <defs>
+    <linearGradient id="bg" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#4c1d95"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="38" y1="34" x2="85" y2="83" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ddd6fe"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#2e1065" flood-opacity=".28"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="32" fill="url(#bg)" filter="url(#shadow)"/>
+  <circle cx="57" cy="55" r="24" fill="none" stroke="url(#lens)" stroke-width="10"/>
+  <path d="M75 73l23 23" stroke="#fff" stroke-width="11" stroke-linecap="round"/>
+  <path d="M44 55h26M57 42v26" stroke="#fff" stroke-width="7" stroke-linecap="round" opacity=".92"/>
+  <circle cx="94" cy="34" r="8" fill="#22c55e" stroke="#fff" stroke-width="4"/>
+</svg>
