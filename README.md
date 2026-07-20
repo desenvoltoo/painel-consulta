@@ -2,6 +2,14 @@
 
 Painel web privado para centralizar consultas realizadas por comandos em um grupo do Telegram.
 
+## Manual de uso
+
+O guia visual para operadores e administradores está disponível em:
+
+- [Manual rápido do Painel de Consultas](docs/MANUAL_DE_USO.md)
+
+O manual explica consultas individuais, consulta em lote, delay entre envios, histórico, exportações, arquivos, administração, filas, falhas e auditoria.
+
 ## Objetivo
 
 O usuário informa um comando, o backend encaminha exatamente o texto ao Telegram, aguarda a resposta correspondente e devolve o conteúdo sem reorganizar, interpretar ou alterar os dados.
@@ -50,7 +58,7 @@ apps/
   api/          API e regras de negócio
   web/          interface do painel
   worker/       integração assíncrona com Telegram
-docs/           requisitos, arquitetura e segurança
+docs/           requisitos, arquitetura, segurança e manual de uso
 infra/          arquivos de implantação
 ```
 
@@ -68,4 +76,4 @@ Este projeto lida com dados pessoais e não deve ser publicado sem:
 
 ## Status
 
-Estrutura e requisitos iniciais em preparação.
+Projeto em desenvolvimento e implantação no EasyPanel.
