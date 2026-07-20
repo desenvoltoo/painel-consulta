@@ -1,23 +1,38 @@
+<p align="center">
+  <img src="../apps/web/public/brand-logo.svg" alt="Logo do Painel de Consultas" width="88" />
+</p>
+
 # Manual rápido — Painel de Consultas
 
-> Guia de uso para operadores e administradores.
+> Guia visual para operadores e administradores.
 
-## 1. Menu principal
+## 1. Acesso
+
+1. Abra o endereço do painel.
+2. Informe seu e-mail e senha.
+3. Clique em **Entrar**.
+4. No primeiro acesso, crie uma nova senha.
+
+O logotipo também aparece na tela de login, no menu lateral e na aba do navegador.
+
+---
+
+## 2. Menu principal
 
 | Área | Para que serve |
 |---|---|
 | **Nova consulta** | Fazer uma consulta individual. |
 | **Consulta em lote** | Consultar vários valores do mesmo tipo. |
-| **Histórico** | Abrir e filtrar consultas anteriores. |
+| **Histórico** | Abrir, pesquisar e filtrar consultas antigas. |
 | **Exportações** | Baixar resultados em CSV ou Excel. |
 | **Administração** | Gerenciar usuários, filas, falhas e auditoria. |
 
 ---
 
-## 2. Consulta individual
+## 3. Consulta individual
 
 ```text
-Escolha o tipo → Digite o dado → Clique em Buscar → Aguarde → Veja o resultado
+Escolha o tipo → Digite o dado → Buscar → Aguarde → Veja o resultado
 ```
 
 Tipos disponíveis:
@@ -38,16 +53,16 @@ Tipos disponíveis:
 ```text
 Tipo: Celular
 Valor: (11) 99999-9999
-Ação: Buscar celular
+Botão: Buscar Celular
 ```
 
-> Confira o valor antes de enviar. Um número incorreto produz uma consulta incorreta.
+> Confira o valor antes de enviar. Uma informação incorreta gera uma consulta incorreta.
 
 ---
 
-## 3. Resultado da consulta
+## 4. Resultado da consulta
 
-O resultado pode aparecer em cartões organizados.
+Os dados aparecem em cartões organizados.
 
 ```text
 Nome       JOÃO DA SILVA       [Copiar]
@@ -57,22 +72,24 @@ Telefone   (11) 99999-9999     [Copiar]
 
 Ações disponíveis:
 
-- **Copiar:** copia somente um campo.
+- **Copiar:** copia somente o campo selecionado.
 - **Copiar tudo:** copia a resposta completa.
 - **TXT:** baixa o resultado em texto.
 - **CSV:** baixa para planilha.
 - **Excel:** baixa em formato XLSX.
-- **Ver resposta original:** mostra exatamente o conteúdo enviado pelo bot.
+- **Ver resposta original:** mostra exatamente o que o bot enviou.
 
 Listas numeradas de empresas são somente para leitura e não iniciam outra consulta.
 
 ---
 
-## 4. Consulta em lote
+## 5. Consulta em lote
 
-Use esta opção para consultar vários valores do mesmo tipo.
+Use esta área para consultar vários CPFs, celulares, CNPJs ou outros valores do mesmo tipo.
 
 ### Como preencher
+
+Digite um valor por linha:
 
 ```text
 11999999999
@@ -80,11 +97,35 @@ Use esta opção para consultar vários valores do mesmo tipo.
 11777777777
 ```
 
-Coloque **um valor por linha** e clique em **Iniciar lote**.
+Depois clique em **Iniciar lote**.
 
-### Delay entre consultas
+### Tela de resultados do lote
 
-O bot do Telegram bloqueia comandos enviados rapidamente. Por isso, o worker respeita um intervalo entre cada item do lote.
+Todos os dados ficam na mesma tela.
+
+- A primeira aba é **Consultados**.
+- Ela mostra todos os valores enviados e seus status.
+- Cada consulta vira uma aba na parte inferior.
+- A aba mostra o valor consultado, como CPF, telefone ou CNPJ.
+- Clique em uma aba para abrir as informações daquela consulta.
+- A área de informações possui scroll próprio.
+- O cabeçalho e as abas permanecem visíveis durante a navegação.
+
+### Cores dos status
+
+| Cor | Status |
+|---|---|
+| Verde | Concluída |
+| Azul | Processando |
+| Amarelo | Aguardando |
+| Vermelho | Falhou |
+| Cinza | Cancelada |
+
+---
+
+## 6. Delay do lote
+
+O bot do Telegram bloqueia comandos enviados rapidamente. Por isso, o painel respeita um intervalo entre os itens.
 
 ```text
 Consulta 1 ── 12 segundos ── Consulta 2 ── 12 segundos ── Consulta 3
@@ -100,47 +141,63 @@ Configuração padrão:
 
 ### Exemplo de duração
 
-Um lote com 10 itens possui 9 intervalos entre os comandos:
+Um lote com 10 itens possui 9 intervalos:
 
 ```text
 9 × 12 segundos = aproximadamente 108 segundos
 ```
 
-Esse tempo não inclui o tempo que o bot leva para responder.
+Esse cálculo não inclui o tempo de resposta do bot.
 
-### Mensagem de velocidade
-
-Quando o bot responder:
+Quando aparecer:
 
 ```text
 Você está consultando rápido demais, aguarde alguns segundos e tente novamente.
 ```
 
-O sistema faz automaticamente:
+O sistema:
 
 1. identifica a mensagem;
 2. espera o período de segurança;
 3. coloca a consulta novamente na fila;
-4. tenta outra vez;
-5. envia para a fila de falhas somente se todas as tentativas acabarem.
+4. tenta novamente;
+5. envia para falhas somente se todas as tentativas acabarem.
 
-> Não clique várias vezes em **Iniciar lote** ou **Buscar**. Aguarde o processamento.
+> Não clique várias vezes em **Buscar** ou **Iniciar lote**. Aguarde o processamento.
 
 ---
 
-## 5. Acompanhamento do lote
+## 7. Exportar o lote
+
+Clique em **Exportar lote em planilha**.
+
+O arquivo é gerado em `.xlsx` e contém:
+
+- aba **Consultados** com todos os valores do lote;
+- uma aba para cada consulta;
+- tipo da consulta;
+- valor consultado;
+- status;
+- usuário;
+- data e tempo;
+- campos identificados;
+- resposta original.
+
+Os nomes das abas são ajustados automaticamente para funcionar no Excel.
+
+---
+
+## 8. Acompanhamento do lote
 
 A tela mostra:
 
 - percentual concluído;
 - consultas concluídas;
-- consultas com falha;
-- itens aguardando na fila;
+- falhas;
+- itens aguardando;
 - status de cada consulta.
 
-Status mais comuns:
-
-| Status | Significado |
+| Status técnico | Significado |
 |---|---|
 | `QUEUED` | Aguardando na fila. |
 | `PROCESSING` | Em processamento. |
@@ -150,17 +207,17 @@ Status mais comuns:
 
 ---
 
-## 6. Arquivos enviados pelo bot
+## 9. Arquivos enviados pelo bot
 
 Quando o Telegram enviar PDF, CSV, TXT, JSON ou outro arquivo, ele aparecerá abaixo do resultado.
 
 Clique em **Baixar arquivo**.
 
-O painel gera um link novo e temporário antes de cada download.
+O painel gera um link seguro e temporário antes de cada download.
 
 ---
 
-## 7. Histórico
+## 10. Histórico
 
 No histórico é possível:
 
@@ -169,13 +226,13 @@ No histórico é possível:
 - filtrar por usuário;
 - abrir resultados antigos;
 - baixar novamente arquivos disponíveis;
-- visualizar quantidade concluída, falhas e tempo médio.
+- visualizar concluídas, falhas e tempo médio.
 
-Operadores visualizam apenas suas consultas. Administradores visualizam todas.
+Operadores visualizam somente suas consultas. Administradores visualizam todas.
 
 ---
 
-## 8. Exportações
+## 11. Exportações gerais
 
 Na área **Exportações**:
 
@@ -186,7 +243,7 @@ A exportação inclui consulta, status, usuário, data, tempo e resposta origina
 
 ---
 
-## 9. Administração
+## 12. Administração
 
 Disponível somente para `ADMIN`.
 
@@ -195,7 +252,7 @@ Disponível somente para `ADMIN`.
 O administrador pode:
 
 - criar usuário;
-- escolher `OPERADOR` ou `ADMIN`;
+- selecionar `OPERADOR` ou `ADMIN`;
 - bloquear e desbloquear;
 - alterar perfil;
 - redefinir senha.
@@ -210,7 +267,7 @@ A área mostra:
 - Redis;
 - worker;
 - fila aguardando;
-- consulta em processamento;
+- consulta atual;
 - fila de falhas.
 
 Ações:
@@ -218,7 +275,7 @@ Ações:
 - **Reprocessar:** devolve uma consulta com erro para a fila.
 - **Limpar falhas:** apaga toda a fila de falhas.
 
-> Analise os erros antes de limpar a fila. Depois da limpeza, os itens não poderão ser reprocessados pela tela.
+> Analise os erros antes de limpar a fila.
 
 ### Auditoria
 
@@ -228,7 +285,7 @@ Também é possível exportar os registros em JSON.
 
 ---
 
-## 10. Problemas comuns
+## 13. Problemas comuns
 
 | Problema | O que fazer |
 |---|---|
@@ -238,6 +295,9 @@ Também é possível exportar os registros em JSON.
 | Consulta parada | Confira worker, Redis e fila. |
 | Bot bloqueou por velocidade | Aguarde; o sistema tentará novamente. |
 | Arquivo não baixa | Abra novamente o resultado e clique em baixar. |
+| Aba do lote não atualiza | Clique em **Atualizar** e aguarde alguns segundos. |
+| Scroll não aparece | Atualize a página com `Ctrl + Shift + R`. |
+| Logo ou ícone antigo | Limpe o cache com `Ctrl + Shift + R`. |
 | Tela antiga após deploy | Pressione `Ctrl + Shift + R`. |
 
 ---
@@ -248,7 +308,10 @@ Também é possível exportar os registros em JSON.
 - [ ] Conferi o dado antes de enviar.
 - [ ] No lote, coloquei um valor por linha.
 - [ ] Aguardei o delay sem clicar novamente.
-- [ ] Conferi a resposta original quando necessário.
+- [ ] Consultei a aba **Consultados**.
+- [ ] Abri as abas individuais quando necessário.
+- [ ] Exportei o lote quando necessário.
+- [ ] Conferi a resposta original.
 - [ ] Saí do painel ao terminar.
 
 ## Checklist do administrador
@@ -259,6 +322,7 @@ Também é possível exportar os registros em JSON.
 - [ ] As falhas foram analisadas antes da limpeza.
 - [ ] O domínio de arquivos responde em `/health`.
 - [ ] A auditoria está registrando as ações.
+- [ ] O delay do Telegram está configurado.
 
 ---
 
