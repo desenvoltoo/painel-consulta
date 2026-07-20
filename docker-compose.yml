@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-painel_consulta}
+      POSTGRES_USER: ${POSTGRES_USER:-painel_consulta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-painel_consulta} -d ${POSTGRES_DB:-painel_consulta}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - consulta_internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - consulta_internal
+
+  api:
+    build:
+      context: ./apps/api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - consulta_storage:/app/storage
+    networks:
+      - consulta_internal
+      - consulta_public
+
+  worker:
+    build:
+      context: ./apps/worker
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - telegram_sessions:/app/sessions
+      - consulta_storage:/app/storage
+    networks:
+      - consulta_internal
+
+  web:
+    build:
+      context: ./apps/web
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - api
+    networks:
+      - consulta_public
+
+volumes:
+  postgres_data:
+  redis_data:
+  telegram_sessions:
+  consulta_storage:
+
+networks:
+  consulta_internal:
+    internal: true
+  consulta_public:
