@@ -1,21 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from uuid import uuid4
 
 import redis.asyncio as redis
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-app = FastAPI(title="Painel de Consulta API", version="0.3.0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://consulta-redis:6379/0")
+QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "120"))
+QUEUE_NAME = os.getenv("QUERY_QUEUE_NAME", "painel-consulta:queries")
+PROCESSING_QUEUE_NAME = os.getenv("QUERY_PROCESSING_QUEUE_NAME", "painel-consulta:processing")
+WORKER_HEARTBEAT_KEY = os.getenv("WORKER_HEARTBEAT_KEY", "painel-consulta:worker:heartbeat")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "12"))
+MAX_BATCH_ITEMS = int(os.getenv("MAX_BATCH_ITEMS", "50"))
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
+LOGIN_BLOCK_SECONDS = int(os.getenv("LOGIN_BLOCK_SECONDS", "900"))
+
+
+def validate_settings() -> None:
+    if len(JWT_SECRET) < 32:
+        raise RuntimeError("JWT_SECRET deve estar configurado com pelo menos 32 caracteres")
+    if QUERY_TIMEOUT_SECONDS < 10:
+        raise RuntimeError("QUERY_TIMEOUT_SECONDS deve ser pelo menos 10")
+    if MAX_BATCH_ITEMS < 1 or MAX_BATCH_ITEMS > 500:
+        raise RuntimeError("MAX_BATCH_ITEMS deve estar entre 1 e 500")
+
+
+validate_settings()
+
+app = FastAPI(title="Painel de Consulta API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("APP_URL", "http://localhost:3000")],
@@ -24,17 +49,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://consulta-redis:6379/0")
-QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "120"))
-QUEUE_NAME = os.getenv("QUERY_QUEUE_NAME", "painel-consulta:queries")
-JWT_SECRET = os.getenv("JWT_SECRET", "troque-esta-chave-em-producao")
-JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "12"))
-MAX_BATCH_ITEMS = int(os.getenv("MAX_BATCH_ITEMS", "50"))
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
 
+@lru_cache(maxsize=1)
 def configured_users() -> dict[str, dict[str, str]]:
     users: dict[str, dict[str, str]] = {}
     definitions = [
@@ -101,7 +120,7 @@ class BatchRequest(BaseModel):
     @field_validator("values")
     @classmethod
     def validate_values(cls, values: list[str]) -> list[str]:
-        cleaned = [item.strip() for item in values if item.strip()]
+        cleaned = list(dict.fromkeys(item.strip() for item in values if item.strip()))
         if not cleaned:
             raise ValueError("Informe ao menos um valor")
         if len(cleaned) > MAX_BATCH_ITEMS:
@@ -139,6 +158,7 @@ def create_token(user: dict[str, str]) -> str:
         "sub": user["email"],
         "name": user["name"],
         "role": user["role"],
+        "iat": datetime.now(timezone.utc),
         "exp": expires,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -161,6 +181,13 @@ async def current_user(
     return user
 
 
+def login_attempt_key(request: Request, email: str) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    digest = hashlib.sha256(f"{client_ip}|{email.lower()}".encode()).hexdigest()
+    return f"painel-consulta:login-attempts:{digest}"
+
+
 async def execute_query(command: str, user: dict[str, str]) -> QueryResponse:
     started = time.perf_counter()
     query_id = str(uuid4())
@@ -176,7 +203,8 @@ async def execute_query(command: str, user: dict[str, str]) -> QueryResponse:
     }
 
     try:
-        await client.rpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
+        # LPUSH + BRPOPLPUSH no worker mantém FIFO e permite recuperação após falhas.
+        await client.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
         result = await client.blpop(result_queue, timeout=QUERY_TIMEOUT_SECONDS)
         if result is None:
             raise HTTPException(status_code=504, detail="O Telegram não respondeu dentro do tempo limite.")
@@ -212,15 +240,56 @@ async def health() -> dict[str, str]:
         await client.aclose()
 
 
+@app.get("/api/system/status")
+async def system_status(user: dict[str, str] = Depends(current_user)) -> dict:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        heartbeat_raw = await client.get(WORKER_HEARTBEAT_KEY)
+        heartbeat = json.loads(heartbeat_raw) if heartbeat_raw else None
+        return {
+            "api": "online",
+            "redis": "online",
+            "worker": "online" if heartbeat else "offline",
+            "worker_details": heartbeat,
+            "queue_waiting": await client.llen(QUEUE_NAME),
+            "queue_processing": await client.llen(PROCESSING_QUEUE_NAME),
+            "requested_by": user["name"],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Falha ao consultar status: {exc}") from exc
+    finally:
+        await client.aclose()
+
+
 @app.post("/api/auth/login", response_model=LoginResponse)
-async def login(payload: LoginRequest) -> LoginResponse:
-    user = configured_users().get(payload.email.lower())
-    if not user or not pwd_context.verify(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
-    return LoginResponse(
-        access_token=create_token(user),
-        user=UserResponse(name=user["name"], email=user["email"], role=user["role"]),
-    )
+async def login(payload: LoginRequest, request: Request) -> LoginResponse:
+    email = payload.email.lower()
+    key = login_attempt_key(request, email)
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        attempts_raw = await client.get(key)
+        attempts = int(attempts_raw or 0)
+        if attempts >= LOGIN_MAX_ATTEMPTS:
+            ttl = await client.ttl(key)
+            raise HTTPException(
+                status_code=429,
+                detail=f"Muitas tentativas. Tente novamente em {max(ttl, 1)} segundos.",
+            )
+
+        user = configured_users().get(email)
+        if not user or not pwd_context.verify(payload.password, user["password_hash"]):
+            attempts = await client.incr(key)
+            if attempts == 1:
+                await client.expire(key, LOGIN_BLOCK_SECONDS)
+            raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
+
+        await client.delete(key)
+        return LoginResponse(
+            access_token=create_token(user),
+            user=UserResponse(name=user["name"], email=user["email"], role=user["role"]),
+        )
+    finally:
+        await client.aclose()
 
 
 @app.get("/api/auth/me", response_model=UserResponse)
