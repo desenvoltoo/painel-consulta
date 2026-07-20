@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
@@ -27,6 +26,11 @@ JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "12"))
 MAX_BATCH_ITEMS = int(os.getenv("MAX_BATCH_ITEMS", "50"))
 LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
 LOGIN_BLOCK_SECONDS = int(os.getenv("LOGIN_BLOCK_SECONDS", "900"))
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "1000"))
+RECORD_TTL_SECONDS = int(os.getenv("RECORD_TTL_SECONDS", "2592000"))
+
+HISTORY_INDEX = "painel-consulta:history"
+BATCH_INDEX = "painel-consulta:batches"
 
 
 def validate_settings() -> None:
@@ -40,7 +44,7 @@ def validate_settings() -> None:
 
 validate_settings()
 
-app = FastAPI(title="Painel de Consulta API", version="0.4.0")
+app = FastAPI(title="Painel de Consulta API", version="0.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("APP_URL", "http://localhost:3000")],
@@ -132,24 +136,31 @@ class QueryResponse(BaseModel):
     id: str
     command: str
     status: str
-    content: str
-    created_at: datetime
-    elapsed_ms: int
-    requested_by: str
-
-
-class BatchItemResponse(BaseModel):
-    value: str
-    success: bool
-    result: QueryResponse | None = None
+    content: str = ""
     error: str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None
+    elapsed_ms: int = 0
+    requested_by: str
+    requested_by_email: str
+    batch_id: str | None = None
 
 
 class BatchResponse(BaseModel):
+    id: str
+    command_prefix: str
+    status: str
     total: int
+    queued: int
+    processing: int
     completed: int
     failed: int
-    items: list[BatchItemResponse]
+    cancelled: int
+    created_at: datetime
+    updated_at: datetime
+    requested_by: str
+    requested_by_email: str
+    items: list[QueryResponse] = []
 
 
 def create_token(user: dict[str, str]) -> str:
@@ -164,9 +175,7 @@ def create_token(user: dict[str, str]) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
-async def current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-) -> dict[str, str]:
+async def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict[str, str]:
     if credentials is None:
         raise HTTPException(status_code=401, detail="Autenticação necessária")
     try:
@@ -174,7 +183,6 @@ async def current_user(
         email = str(payload.get("sub", "")).lower()
     except JWTError as exc:
         raise HTTPException(status_code=401, detail="Sessão inválida ou expirada") from exc
-
     user = configured_users().get(email)
     if not user:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
@@ -188,44 +196,87 @@ def login_attempt_key(request: Request, email: str) -> str:
     return f"painel-consulta:login-attempts:{digest}"
 
 
-async def execute_query(command: str, user: dict[str, str]) -> QueryResponse:
-    started = time.perf_counter()
+def query_key(query_id: str) -> str:
+    return f"painel-consulta:query:{query_id}"
+
+
+def batch_key(batch_id: str) -> str:
+    return f"painel-consulta:batch:{batch_id}"
+
+
+def serialize_record(data: dict) -> dict[str, str]:
+    return {key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value) for key, value in data.items() if value is not None}
+
+
+def parse_hash(data: dict[str, str]) -> dict:
+    parsed: dict = {}
+    for key, value in data.items():
+        if key in {"total", "queued", "processing", "completed", "failed", "cancelled", "elapsed_ms"}:
+            parsed[key] = int(value)
+        elif key == "items":
+            parsed[key] = json.loads(value or "[]")
+        else:
+            parsed[key] = value
+    return parsed
+
+
+async def save_query(client, record: dict) -> None:
+    key = query_key(record["id"])
+    await client.hset(key, mapping=serialize_record(record))
+    await client.expire(key, RECORD_TTL_SECONDS)
+    score = datetime.fromisoformat(record["created_at"]).timestamp()
+    await client.zadd(HISTORY_INDEX, {record["id"]: score})
+    await client.zremrangebyrank(HISTORY_INDEX, 0, -(HISTORY_LIMIT + 1))
+
+
+async def read_query(client, query_id: str) -> QueryResponse | None:
+    data = await client.hgetall(query_key(query_id))
+    return QueryResponse(**parse_hash(data)) if data else None
+
+
+async def read_batch(client, batch_id: str, include_items: bool = True) -> BatchResponse | None:
+    data = await client.hgetall(batch_key(batch_id))
+    if not data:
+        return None
+    parsed = parse_hash(data)
+    item_ids = parsed.pop("items", [])
+    items: list[QueryResponse] = []
+    if include_items:
+        for query_id in item_ids:
+            item = await read_query(client, query_id)
+            if item:
+                items.append(item)
+    parsed["items"] = items
+    return BatchResponse(**parsed)
+
+
+async def enqueue_query(client, command: str, user: dict[str, str], batch_id: str | None = None) -> QueryResponse:
     query_id = str(uuid4())
     created_at = datetime.now(timezone.utc)
     result_queue = f"painel-consulta:result:{query_id}"
-    client = redis.from_url(REDIS_URL, decode_responses=True)
+    record = {
+        "id": query_id,
+        "command": command,
+        "status": "QUEUED",
+        "content": "",
+        "created_at": created_at.isoformat(),
+        "elapsed_ms": 0,
+        "requested_by": user["name"],
+        "requested_by_email": user["email"],
+        "batch_id": batch_id,
+    }
+    await save_query(client, record)
     job = {
         "id": query_id,
         "command": command,
         "created_at": created_at.isoformat(),
         "result_queue": result_queue,
         "requested_by": user["email"],
+        "requested_by_name": user["name"],
+        "batch_id": batch_id,
     }
-
-    try:
-        # LPUSH + BRPOPLPUSH no worker mantém FIFO e permite recuperação após falhas.
-        await client.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
-        result = await client.blpop(result_queue, timeout=QUERY_TIMEOUT_SECONDS)
-        if result is None:
-            raise HTTPException(status_code=504, detail="O Telegram não respondeu dentro do tempo limite.")
-
-        _, raw_result = result
-        data = json.loads(raw_result)
-        if data.get("status") != "COMPLETED":
-            raise HTTPException(status_code=502, detail=data.get("error", "Falha no Telegram"))
-
-        return QueryResponse(
-            id=query_id,
-            command=command,
-            status="COMPLETED",
-            content=data.get("content", ""),
-            created_at=created_at,
-            elapsed_ms=round((time.perf_counter() - started) * 1000),
-            requested_by=user["name"],
-        )
-    finally:
-        await client.delete(result_queue)
-        await client.aclose()
+    await client.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
+    return QueryResponse(**record)
 
 
 @app.get("/api/health")
@@ -255,8 +306,6 @@ async def system_status(user: dict[str, str] = Depends(current_user)) -> dict:
             "queue_processing": await client.llen(PROCESSING_QUEUE_NAME),
             "requested_by": user["name"],
         }
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Falha ao consultar status: {exc}") from exc
     finally:
         await client.aclose()
 
@@ -267,27 +316,18 @@ async def login(payload: LoginRequest, request: Request) -> LoginResponse:
     key = login_attempt_key(request, email)
     client = redis.from_url(REDIS_URL, decode_responses=True)
     try:
-        attempts_raw = await client.get(key)
-        attempts = int(attempts_raw or 0)
+        attempts = int(await client.get(key) or 0)
         if attempts >= LOGIN_MAX_ATTEMPTS:
             ttl = await client.ttl(key)
-            raise HTTPException(
-                status_code=429,
-                detail=f"Muitas tentativas. Tente novamente em {max(ttl, 1)} segundos.",
-            )
-
+            raise HTTPException(status_code=429, detail=f"Muitas tentativas. Tente novamente em {max(ttl, 1)} segundos.")
         user = configured_users().get(email)
         if not user or not pwd_context.verify(payload.password, user["password_hash"]):
             attempts = await client.incr(key)
             if attempts == 1:
                 await client.expire(key, LOGIN_BLOCK_SECONDS)
             raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
-
         await client.delete(key)
-        return LoginResponse(
-            access_token=create_token(user),
-            user=UserResponse(name=user["name"], email=user["email"], role=user["role"]),
-        )
+        return LoginResponse(access_token=create_token(user), user=UserResponse(name=user["name"], email=user["email"], role=user["role"]))
     finally:
         await client.aclose()
 
@@ -298,34 +338,145 @@ async def me(user: dict[str, str] = Depends(current_user)) -> UserResponse:
 
 
 @app.post("/api/queries", response_model=QueryResponse)
-async def create_query(
-    payload: QueryRequest,
-    user: dict[str, str] = Depends(current_user),
-) -> QueryResponse:
-    return await execute_query(payload.command, user)
+async def create_query(payload: QueryRequest, user: dict[str, str] = Depends(current_user)) -> QueryResponse:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        queued = await enqueue_query(client, payload.command, user)
+        result_queue = f"painel-consulta:result:{queued.id}"
+        result = await client.blpop(result_queue, timeout=QUERY_TIMEOUT_SECONDS)
+        if result is None:
+            latest = await read_query(client, queued.id)
+            if latest:
+                return latest
+            raise HTTPException(status_code=504, detail="O Telegram não respondeu dentro do tempo limite.")
+        latest = await read_query(client, queued.id)
+        if not latest:
+            raise HTTPException(status_code=502, detail="Resultado não encontrado")
+        if latest.status == "FAILED":
+            raise HTTPException(status_code=502, detail=latest.error or "Falha no Telegram")
+        return latest
+    finally:
+        await client.delete(f"painel-consulta:result:{locals().get('queued').id}") if "queued" in locals() else None
+        await client.aclose()
+
+
+@app.get("/api/history", response_model=list[QueryResponse])
+async def history(limit: int = 100, user: dict[str, str] = Depends(current_user)) -> list[QueryResponse]:
+    limit = max(1, min(limit, 500))
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        ids = await client.zrevrange(HISTORY_INDEX, 0, HISTORY_LIMIT - 1)
+        result: list[QueryResponse] = []
+        for query_id in ids:
+            item = await read_query(client, query_id)
+            if not item:
+                continue
+            if user["role"] != "ADMIN" and item.requested_by_email != user["email"]:
+                continue
+            result.append(item)
+            if len(result) >= limit:
+                break
+        return result
+    finally:
+        await client.aclose()
 
 
 @app.post("/api/queries/batch", response_model=BatchResponse)
-async def create_batch(
-    payload: BatchRequest,
-    user: dict[str, str] = Depends(current_user),
-) -> BatchResponse:
-    items: list[BatchItemResponse] = []
-    for value in payload.values:
-        command = f"{payload.command_prefix} {value}".strip()
-        try:
-            result = await execute_query(command, user)
-            items.append(BatchItemResponse(value=value, success=True, result=result))
-        except HTTPException as exc:
-            items.append(BatchItemResponse(value=value, success=False, error=str(exc.detail)))
-        except Exception as exc:
-            items.append(BatchItemResponse(value=value, success=False, error=str(exc)))
-        await asyncio.sleep(0.4)
+async def create_batch(payload: BatchRequest, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    batch_id = str(uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        item_ids: list[str] = []
+        for value in payload.values:
+            item = await enqueue_query(client, f"{payload.command_prefix} {value}".strip(), user, batch_id=batch_id)
+            item_ids.append(item.id)
+        record = {
+            "id": batch_id,
+            "command_prefix": payload.command_prefix,
+            "status": "QUEUED",
+            "total": len(item_ids),
+            "queued": len(item_ids),
+            "processing": 0,
+            "completed": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "created_at": now,
+            "updated_at": now,
+            "requested_by": user["name"],
+            "requested_by_email": user["email"],
+            "items": item_ids,
+        }
+        await client.hset(batch_key(batch_id), mapping=serialize_record(record))
+        await client.expire(batch_key(batch_id), RECORD_TTL_SECONDS)
+        await client.zadd(BATCH_INDEX, {batch_id: datetime.fromisoformat(now).timestamp()})
+        return (await read_batch(client, batch_id))  # type: ignore[return-value]
+    finally:
+        await client.aclose()
 
-    completed = sum(1 for item in items if item.success)
-    return BatchResponse(
-        total=len(items),
-        completed=completed,
-        failed=len(items) - completed,
-        items=items,
-    )
+
+@app.get("/api/batches", response_model=list[BatchResponse])
+async def list_batches(limit: int = 50, user: dict[str, str] = Depends(current_user)) -> list[BatchResponse]:
+    limit = max(1, min(limit, 200))
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        ids = await client.zrevrange(BATCH_INDEX, 0, 499)
+        result: list[BatchResponse] = []
+        for batch_id in ids:
+            batch = await read_batch(client, batch_id, include_items=False)
+            if not batch:
+                continue
+            if user["role"] != "ADMIN" and batch.requested_by_email != user["email"]:
+                continue
+            result.append(batch)
+            if len(result) >= limit:
+                break
+        return result
+    finally:
+        await client.aclose()
+
+
+@app.get("/api/batches/{batch_id}", response_model=BatchResponse)
+async def get_batch(batch_id: str, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        batch = await read_batch(client, batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail="Lote não encontrado")
+        if user["role"] != "ADMIN" and batch.requested_by_email != user["email"]:
+            raise HTTPException(status_code=403, detail="Acesso negado")
+        return batch
+    finally:
+        await client.aclose()
+
+
+@app.post("/api/batches/{batch_id}/cancel", response_model=BatchResponse)
+async def cancel_batch(batch_id: str, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        batch = await read_batch(client, batch_id, include_items=False)
+        if not batch:
+            raise HTTPException(status_code=404, detail="Lote não encontrado")
+        if user["role"] != "ADMIN" and batch.requested_by_email != user["email"]:
+            raise HTTPException(status_code=403, detail="Acesso negado")
+        await client.hset(batch_key(batch_id), mapping={"status": "CANCEL_REQUESTED", "updated_at": datetime.now(timezone.utc).isoformat()})
+        return (await read_batch(client, batch_id))  # type: ignore[return-value]
+    finally:
+        await client.aclose()
+
+
+@app.post("/api/batches/{batch_id}/retry-failed", response_model=BatchResponse)
+async def retry_failed(batch_id: str, user: dict[str, str] = Depends(current_user)) -> BatchResponse:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        batch = await read_batch(client, batch_id)
+        if not batch:
+            raise HTTPException(status_code=404, detail="Lote não encontrado")
+        if user["role"] != "ADMIN" and batch.requested_by_email != user["email"]:
+            raise HTTPException(status_code=403, detail="Acesso negado")
+        failed_values = [item.command.removeprefix(batch.command_prefix).strip() for item in batch.items if item.status == "FAILED"]
+        if not failed_values:
+            raise HTTPException(status_code=400, detail="Este lote não possui falhas para repetir")
+        return await create_batch(BatchRequest(command_prefix=batch.command_prefix, values=failed_values), user)
+    finally:
+        await client.aclose()
