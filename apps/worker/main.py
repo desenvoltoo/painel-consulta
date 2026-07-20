@@ -2,8 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import suppress
 from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import redis.asyncio as redis
 from telethon import TelegramClient, events, utils
@@ -22,6 +25,10 @@ RESPONSE_SETTLE_SECONDS = float(os.getenv("TELEGRAM_RESPONSE_SETTLE_SECONDS", "1
 RECORD_TTL_SECONDS = int(os.getenv("RECORD_TTL_SECONDS", "2592000"))
 MAX_RETRIES = int(os.getenv("QUERY_MAX_RETRIES", "2"))
 RETRY_DELAY_SECONDS = float(os.getenv("QUERY_RETRY_DELAY_SECONDS", "2"))
+FILE_STORAGE_PATH = Path(os.getenv("FILE_STORAGE_PATH", "/app/files"))
+MAX_FILE_BYTES = int(os.getenv("MAX_TELEGRAM_FILE_BYTES", str(20 * 1024 * 1024)))
+MAX_TEXT_PREVIEW_CHARS = int(os.getenv("MAX_TEXT_PREVIEW_CHARS", "200000"))
+TEXT_EXTENSIONS = {".txt", ".csv", ".json", ".xml", ".log", ".md", ".tsv"}
 
 
 def query_key(query_id: str) -> str:
@@ -30,6 +37,11 @@ def query_key(query_id: str) -> str:
 
 def batch_key(batch_id: str) -> str:
     return f"painel-consulta:batch:{batch_id}"
+
+
+def safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return cleaned[:180] or "arquivo"
 
 
 async def resolve_group(client: TelegramClient, configured_id: int):
@@ -107,8 +119,7 @@ async def update_batch(redis_client, batch_id: str | None, from_status: str, to_
         pipe.hincrby(key, to_status.lower(), 1)
     pipe.hset(key, mapping={"updated_at": datetime.now(timezone.utc).isoformat()})
     await pipe.execute()
-    values = await redis_client.hmget(key, "total", "completed", "failed", "cancelled", "processing", "queued", "status")
-    total, completed, failed, cancelled, processing, queued, current_status = values
+    total, completed, failed, cancelled, _processing, _queued, current_status = await redis_client.hmget(key, "total", "completed", "failed", "cancelled", "processing", "queued", "status")
     finished = int(completed or 0) + int(failed or 0) + int(cancelled or 0)
     if finished >= int(total or 0):
         final_status = "COMPLETED" if int(failed or 0) == 0 else "COMPLETED_WITH_ERRORS"
@@ -118,13 +129,10 @@ async def update_batch(redis_client, batch_id: str | None, from_status: str, to_
 
 
 async def should_cancel(redis_client, batch_id: str | None) -> bool:
-    if not batch_id:
-        return False
-    status = await redis_client.hget(batch_key(batch_id), "status")
-    return status == "CANCEL_REQUESTED"
+    return bool(batch_id and await redis_client.hget(batch_key(batch_id), "status") == "CANCEL_REQUESTED")
 
 
-async def finalize_query(redis_client, job: dict, status: str, content: str = "", error: str | None = None, elapsed_ms: int = 0) -> None:
+async def finalize_query(redis_client, job: dict, status: str, content: str = "", error: str | None = None, elapsed_ms: int = 0, attachments: list[dict] | None = None) -> None:
     query_id = job.get("id")
     if not query_id:
         return
@@ -134,6 +142,7 @@ async def finalize_query(redis_client, job: dict, status: str, content: str = ""
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_ms": elapsed_ms,
         "attempts": int(job.get("attempt", 0)) + 1,
+        "attachments": json.dumps(attachments or [], ensure_ascii=False),
     }
     if error:
         mapping["error"] = error
@@ -141,7 +150,7 @@ async def finalize_query(redis_client, job: dict, status: str, content: str = ""
     await redis_client.expire(query_key(query_id), RECORD_TTL_SECONDS)
 
 
-async def retry_or_fail(redis_client, raw_job: str, job: dict, batch_id: str | None, error: str) -> bool:
+async def retry_or_fail(redis_client, job: dict, batch_id: str | None, error: str) -> bool:
     attempt = int(job.get("attempt", 0))
     if attempt < MAX_RETRIES:
         job["attempt"] = attempt + 1
@@ -153,15 +162,34 @@ async def retry_or_fail(redis_client, raw_job: str, job: dict, batch_id: str | N
         await redis_client.lpush(QUEUE_NAME, json.dumps(job, ensure_ascii=False))
         logger.warning("Consulta %s reenfileirada. Tentativa %s/%s.", job.get("id"), attempt + 1, MAX_RETRIES)
         return True
-
-    dead_letter = {
-        **job,
-        "final_error": error,
-        "failed_at": datetime.now(timezone.utc).isoformat(),
-        "attempts": attempt + 1,
-    }
-    await redis_client.lpush(DEAD_LETTER_QUEUE_NAME, json.dumps(dead_letter, ensure_ascii=False))
+    await redis_client.lpush(DEAD_LETTER_QUEUE_NAME, json.dumps({**job, "final_error": error, "failed_at": datetime.now(timezone.utc).isoformat(), "attempts": attempt + 1}, ensure_ascii=False))
     return False
+
+
+async def download_attachment(client: TelegramClient, message, query_id: str) -> tuple[dict, str]:
+    original_name = message.file.name or f"arquivo-{message.id}"
+    size = int(getattr(message.file, "size", 0) or 0)
+    extension = Path(original_name).suffix.lower()
+    metadata = {"id": str(uuid4()), "name": original_name, "size": size, "extension": extension, "stored": False}
+    if size > MAX_FILE_BYTES:
+        return metadata, f"Arquivo recebido: {original_name} ({size} bytes) — excede o limite de download."
+
+    target_dir = FILE_STORAGE_PATH / safe_filename(query_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stored_name = f"{metadata['id']}-{safe_filename(original_name)}"
+    target_path = target_dir / stored_name
+    downloaded = await client.download_media(message, file=str(target_path))
+    if not downloaded:
+        return metadata, f"Arquivo recebido: {original_name} — não foi possível baixar."
+
+    metadata.update({"stored": True, "stored_name": stored_name, "relative_path": f"{safe_filename(query_id)}/{stored_name}"})
+    if extension in TEXT_EXTENSIONS:
+        try:
+            text = target_path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT_PREVIEW_CHARS]
+            return metadata, f"ARQUIVO: {original_name}\n{text}"
+        except Exception as exc:
+            logger.warning("Falha ao ler arquivo textual %s: %s", target_path, exc)
+    return metadata, f"Arquivo recebido e armazenado: {original_name} ({size} bytes)"
 
 
 async def process_job(client, redis_client, group_entity, bot_entity, raw_job: str, job: dict, current_job: dict) -> None:
@@ -185,6 +213,7 @@ async def process_job(client, redis_client, group_entity, bot_entity, raw_job: s
 
     first_response = asyncio.Event()
     response_parts: list[str] = []
+    attachments: list[dict] = []
     sent_message_id: int | None = None
     sent_at = datetime.now(timezone.utc)
 
@@ -200,15 +229,19 @@ async def process_job(client, redis_client, group_entity, bot_entity, raw_job: s
             return
         content = message.raw_text or ""
         if message.file:
-            file_name = message.file.name or "sem_nome"
-            content = content or f"Arquivo recebido: {file_name}"
+            try:
+                attachment, file_content = await download_attachment(client, message, query_id)
+                attachments.append(attachment)
+                content = "\n".join(part for part in [content, file_content] if part).strip()
+            except Exception as exc:
+                logger.exception("Falha ao baixar arquivo da consulta %s", query_id)
+                content = "\n".join(part for part in [content, f"Arquivo recebido, mas o download falhou: {exc}"] if part).strip()
         if content:
             response_parts.append(content)
             first_response.set()
 
     event_builder = events.NewMessage(chats=group_entity, from_users=bot_entity)
     client.add_event_handler(on_bot_message, event_builder)
-
     try:
         logger.info("Enviando consulta %s ao Telegram.", query_id)
         sent_message = await client.send_message(group_entity, command)
@@ -218,25 +251,25 @@ async def process_job(client, redis_client, group_entity, bot_entity, raw_job: s
         await asyncio.sleep(RESPONSE_SETTLE_SECONDS)
         content = "\n\n".join(response_parts).strip()
         elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        await finalize_query(redis_client, job, "COMPLETED", content=content, elapsed_ms=elapsed_ms)
+        await finalize_query(redis_client, job, "COMPLETED", content=content, elapsed_ms=elapsed_ms, attachments=attachments)
         await update_batch(redis_client, batch_id, "PROCESSING", "COMPLETED")
-        await publish_result(redis_client, result_queue, {"status": "COMPLETED", "content": content})
-        logger.info("Consulta %s concluída com %s resposta(s).", query_id, len(response_parts))
+        await publish_result(redis_client, result_queue, {"status": "COMPLETED", "content": content, "attachments": attachments})
+        logger.info("Consulta %s concluída com %s resposta(s) e %s arquivo(s).", query_id, len(response_parts), len(attachments))
     except asyncio.TimeoutError:
         error = "O bot não respondeu dentro do tempo limite."
-        retried = await retry_or_fail(redis_client, raw_job, job, batch_id, error)
+        retried = await retry_or_fail(redis_client, job, batch_id, error)
         if not retried:
             elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-            await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms)
+            await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms, attachments=attachments)
             await update_batch(redis_client, batch_id, "PROCESSING", "FAILED")
             await publish_result(redis_client, result_queue, {"status": "ERROR", "error": error})
         logger.warning("Consulta %s expirou aguardando resposta.", query_id)
     except Exception as exc:
         error = str(exc)
-        retried = await retry_or_fail(redis_client, raw_job, job, batch_id, error)
+        retried = await retry_or_fail(redis_client, job, batch_id, error)
         if not retried:
             elapsed_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-            await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms)
+            await finalize_query(redis_client, job, "FAILED", error=error, elapsed_ms=elapsed_ms, attachments=attachments)
             await update_batch(redis_client, batch_id, "PROCESSING", "FAILED")
             await publish_result(redis_client, result_queue, {"status": "ERROR", "error": error})
         logger.exception("Falha ao processar consulta %s.", query_id)
@@ -256,6 +289,7 @@ async def main() -> None:
     if missing:
         raise RuntimeError(f"Variáveis obrigatórias ausentes: {', '.join(missing)}")
 
+    FILE_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
     client = TelegramClient(session_path, int(api_id), api_hash)
     await client.connect()
     if not await client.is_user_authorized():
@@ -269,8 +303,7 @@ async def main() -> None:
 
     current_job: dict = {}
     heartbeat_task = asyncio.create_task(heartbeat_loop(redis_client, group_entity, bot_username, current_job))
-    logger.info("Worker pronto. Grupo=%s Bot=@%s Fila=%s Processamento=%s DeadLetter=%s", utils.get_peer_id(group_entity), bot_username, QUEUE_NAME, PROCESSING_QUEUE_NAME, DEAD_LETTER_QUEUE_NAME)
-
+    logger.info("Worker pronto. Grupo=%s Bot=@%s Fila=%s Processamento=%s DeadLetter=%s Arquivos=%s", utils.get_peer_id(group_entity), bot_username, QUEUE_NAME, PROCESSING_QUEUE_NAME, DEAD_LETTER_QUEUE_NAME, FILE_STORAGE_PATH)
     try:
         while True:
             raw_job = await redis_client.brpoplpush(QUEUE_NAME, PROCESSING_QUEUE_NAME, timeout=30)
